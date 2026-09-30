@@ -63,6 +63,15 @@ impl Grid {
         }
     }
 
+    /// Rewrite every value, zeros included, through `f`.
+    pub fn map_values(&mut self, f: impl Fn(u8) -> u8) {
+        for chunk in self.chunks.values_mut() {
+            for v in chunk.iter_mut() {
+                *v = f(*v);
+            }
+        }
+    }
+
     /// Drop chunks that hold nothing but zeros.
     pub fn prune(&mut self) {
         self.chunks.retain(|_, c| c.iter().any(|&v| v != 0));

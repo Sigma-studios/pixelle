@@ -1,0 +1,9 @@
+[package]
+name = "pixelle-build"
+description = "build.rs helper: bake a Pixelle project and generate typed constants for its sprites"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+pixelle-core.workspace = true

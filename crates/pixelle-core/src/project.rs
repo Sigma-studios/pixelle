@@ -107,6 +107,68 @@ impl Project {
         self.swaps.iter().find(|s| s.name == name)
     }
 
+    /// Add a colour at the end of the `section`-th palette section, shifting later indices up and
+    /// remapping every pixel, swap and swap slot to match.
+    pub fn insert_color(
+        &mut self,
+        section: usize,
+        name: impl Into<String>,
+        rgba: crate::palette::Rgba,
+    ) -> Result<u8, crate::palette::PaletteFull> {
+        let s = &self.palette.sections()[section];
+        let at = (s.start + s.len) as u8;
+        // Remap before inserting: an old index at or past the gap moves up.
+        if (at as usize) < self.palette.len() {
+            self.remap_indices(|v| if v >= at && v != 0 { v + 1 } else { v });
+        }
+        self.palette.insert_into_section(section, name.into(), rgba)
+    }
+
+    /// Remove a colour. Pixels of it become `replace_with` (an index as it is now), and later
+    /// indices shift down.
+    pub fn remove_color(&mut self, index: u8, replace_with: u8) {
+        if index == 0 {
+            return;
+        }
+        let replace = if replace_with > index { replace_with - 1 } else { replace_with };
+        let replace = if replace_with == index { 0 } else { replace };
+        self.remap_indices(|v| match v {
+            v if v == index => replace,
+            v if v > index => v - 1,
+            v => v,
+        });
+        self.swaps.retain(|s| s.index != index);
+        self.palette.remove(index);
+    }
+
+    /// How many pixels on pixel layers hold this index.
+    pub fn color_usage(&self, index: u8) -> usize {
+        self.layers
+            .iter()
+            .filter_map(|l| l.pixels())
+            .map(|g| g.iter().filter(|(_, v)| *v == index).count())
+            .sum()
+    }
+
+    fn remap_indices(&mut self, f: impl Fn(u8) -> u8) {
+        for layer in &mut self.layers {
+            match &mut layer.kind {
+                LayerKind::Pixels(g) => g.map_values(&f),
+                LayerKind::Instances(list) => {
+                    for i in list {
+                        for (_, v) in &mut i.swaps {
+                            *v = f(*v);
+                        }
+                    }
+                }
+                LayerKind::Terrain(_) => {}
+            }
+        }
+        for s in &mut self.swaps {
+            s.index = f(s.index);
+        }
+    }
+
     /// Everything drawn on the canvas, instances and terrain included.
     pub fn bounds(&self) -> IRect {
         let mut out = IRect::default();
@@ -209,5 +271,37 @@ impl Project {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geom::IVec2;
+    use crate::grid::Grid;
+
+    #[test]
+    fn inserting_and_removing_colours_keeps_pixels_pointing_at_them() {
+        let mut p = Project::new("t");
+        p.palette.begin_section("A");
+        let a = p.palette.push("a", [1, 0, 0, 255]).unwrap();
+        p.palette.begin_section("B");
+        let b = p.palette.push("b", [2, 0, 0, 255]).unwrap();
+        let mut g = Grid::new();
+        g.set(IVec2::new(0, 0), a);
+        g.set(IVec2::new(1, 0), b);
+        let l = p.add_layer("art", LayerKind::Pixels(g));
+
+        let new = p.insert_color(0, "a2", [3, 0, 0, 255]).unwrap();
+        assert_eq!(new, 2);
+        let px = |p: &Project, x| p.palette.rgba(p.layer(l).unwrap().pixels().unwrap().get(IVec2::new(x, 0)));
+        assert_eq!(px(&p, 0), [1, 0, 0, 255]);
+        assert_eq!(px(&p, 1), [2, 0, 0, 255]);
+        assert_eq!(p.palette.section("B").unwrap().start, 3);
+
+        p.remove_color(1, 2);
+        assert_eq!(px(&p, 0), [3, 0, 0, 255]);
+        assert_eq!(px(&p, 1), [2, 0, 0, 255]);
+        assert_eq!(p.palette.section("A").unwrap().len, 1);
     }
 }

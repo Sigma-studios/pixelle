@@ -217,6 +217,93 @@ pub mod presets {
         ]
     }
 
+    /// Sixteen tiles chosen by which of the four sides are the same terrain. Tile `i` is the one
+    /// whose side bits are `i`: up 1, right 2, down 4, left 8 — so tile 0 stands alone and tile 15
+    /// is surrounded.
+    pub fn edge16() -> Vec<Rule> {
+        (0..16u32)
+            .map(|m| {
+                let side = |bit: u32| if m & bit != 0 { Cond::Same } else { Cond::NotSame };
+                let mut pattern = [Cond::Any; 8];
+                pattern[1] = side(1);
+                pattern[4] = side(2);
+                pattern[6] = side(4);
+                pattern[3] = side(8);
+                Rule {
+                    name: format!("sides {m:04b}"),
+                    pattern,
+                    tile: m,
+                    transform: D4::IDENTITY,
+                    symmetric: false,
+                }
+            })
+            .collect()
+    }
+
+    /// The 47 distinct neighbourhoods of the "blob" set: all eight neighbours, where a corner only
+    /// counts when both sides next to it are the same terrain. Tile `i` is the `i`-th of
+    /// [`blob47_masks`], in ascending order.
+    pub fn blob47() -> Vec<Rule> {
+        blob47_masks()
+            .into_iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let mut pattern = [Cond::Any; 8];
+                for (slot, bit) in BLOB_BITS.iter().enumerate() {
+                    let is_corner = matches!(slot, 0 | 2 | 5 | 7);
+                    if is_corner && !corner_counts(m, slot) {
+                        continue;
+                    }
+                    pattern[slot] = if m & bit != 0 { Cond::Same } else { Cond::NotSame };
+                }
+                Rule {
+                    name: format!("blob {m:08b}"),
+                    pattern,
+                    tile: i as u32,
+                    transform: D4::IDENTITY,
+                    symmetric: false,
+                }
+            })
+            .collect()
+    }
+
+    /// The bit each neighbour contributes to a blob mask, in [`NEIGHBOURS`] order: up-left 128,
+    /// up 1, up-right 2, left 64, right 4, down-left 32, down 16, down-right 8.
+    pub const BLOB_BITS: [u8; 8] = [128, 1, 2, 64, 4, 32, 16, 8];
+
+    /// The two sides next to a corner slot, as bits.
+    fn corner_sides(slot: usize) -> u8 {
+        match slot {
+            0 => 1 | 64,
+            2 => 1 | 4,
+            5 => 16 | 64,
+            7 => 16 | 4,
+            _ => 0,
+        }
+    }
+
+    fn corner_counts(mask: u8, slot: usize) -> bool {
+        mask & corner_sides(slot) == corner_sides(slot)
+    }
+
+    /// Every blob mask with its meaningless corners cleared, ascending: 47 of them.
+    pub fn blob47_masks() -> Vec<u8> {
+        let mut out: Vec<u8> = (0..=255u8)
+            .map(|m| {
+                let mut m = m;
+                for slot in [0, 2, 5, 7] {
+                    if !corner_counts(m, slot) {
+                        m &= !BLOB_BITS[slot];
+                    }
+                }
+                m
+            })
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// A horizontal run: caps at each end, a middle between. A run one cell long shows `single`.
     pub fn horizontal_run(left: u32, middle: u32, right: u32, single: u32) -> Vec<Rule> {
         let rule = |name: &str, picture: &str, tile: u32| {
@@ -349,6 +436,33 @@ mod tests {
         assert_eq!(wide[1][2], Some((INSIDE, D4::IDENTITY)));
         // And under the left end, mirrored.
         assert_eq!(wide[1][1], Some((INSIDE, D4::FLIP_X)));
+    }
+
+    #[test]
+    fn blob47_matches_every_neighbourhood_exactly_once() {
+        let rules = blob47();
+        assert_eq!(rules.len(), 47);
+        for m in 0..=255u8 {
+            let same = |d: IVec2| {
+                let slot = NEIGHBOURS.iter().position(|n| *n == d).unwrap();
+                m & BLOB_BITS[slot] != 0
+            };
+            let hits = rules.iter().filter(|r| r.resolve(&same).is_some()).count();
+            assert_eq!(hits, 1, "mask {m:08b}");
+        }
+    }
+
+    #[test]
+    fn edge16_indexes_by_sides() {
+        let t = Terrain {
+            name: "t".into(),
+            tileset: "t".into(),
+            rules: edge16(),
+            fallback: None,
+        };
+        // Same terrain above and to the left: 1 + 8.
+        let got = t.resolve(|d| d == IVec2::new(0, -1) || d == IVec2::new(-1, 0));
+        assert_eq!(got, Some((9, D4::IDENTITY)));
     }
 
     #[test]

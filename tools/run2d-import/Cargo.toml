@@ -9,4 +9,3 @@ publish = false
 [dependencies]
 pixelle-core.workspace = true
 anyhow.workspace = true
-miniz_oxide.workspace = true

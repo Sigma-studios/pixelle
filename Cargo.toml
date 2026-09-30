@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/pixelle-core", "crates/pixelle-cli", "tools/run2d-import"]
+members = [
+    "crates/pixelle-core",
+    "crates/pixelle-cli",
+    "crates/pixelle-build",
+    "tools/run2d-import",
+]
 
 [workspace.package]
 edition = "2024"
@@ -9,6 +14,7 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 pixelle-core = { path = "crates/pixelle-core" }
+pixelle-build = { path = "crates/pixelle-build" }
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
 miniz_oxide = "0.8"

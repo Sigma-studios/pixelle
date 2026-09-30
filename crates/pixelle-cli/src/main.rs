@@ -7,7 +7,8 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use pixelle_core::layer::LayerKind;
 use pixelle_core::render::Renderer;
-use pixelle_core::{IRect, Project, format, pack, png_io};
+use pixelle_core::palette::presets;
+use pixelle_core::{Frame, IRect, IVec2, Project, Sprite, bake, format, import, pack, png_io};
 
 #[derive(Parser)]
 #[command(name = "pixelle", about = "Inspect, render and pack Pixelle projects")]
@@ -50,6 +51,64 @@ enum Command {
         /// Write an 8-bit palette PNG (the project palette) instead of RGBA.
         #[arg(long)]
         indexed: bool,
+    },
+    /// Start a project with a preset palette.
+    New {
+        file: PathBuf,
+        /// db32, pico8 or endesga32.
+        #[arg(long, default_value = "db32")]
+        palette: String,
+    },
+    /// Write the runtime file a game ships: packed atlas, names, anchors, recolour slots.
+    Bake {
+        file: PathBuf,
+        #[arg(short, long)]
+        out: PathBuf,
+    },
+    /// Print (or write) the typed constants `pixelle-build` generates.
+    Codegen {
+        file: PathBuf,
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        #[arg(long, default_value = "art")]
+        module: String,
+    },
+    /// Paint a PNG onto a pixel layer, matching colours exactly and adding what is new.
+    ImportPng {
+        file: PathBuf,
+        png: PathBuf,
+        /// Top-left on the canvas: x,y.
+        #[arg(long, default_value = "0,0")]
+        at: String,
+        /// The pixel layer to paint on; created if missing.
+        #[arg(long, default_value = "Art")]
+        layer: String,
+        /// Also make a sprite of it with this name.
+        #[arg(long)]
+        sprite: Option<String>,
+    },
+    /// Import an .aseprite file: frames left to right, a sprite per tag with its timings.
+    ImportAseprite {
+        file: PathBuf,
+        aseprite: PathBuf,
+        #[arg(long, default_value = "0,0")]
+        at: String,
+        #[arg(long, default_value = "Art")]
+        layer: String,
+        /// Sprite name (prefix, when the file has tags). Defaults to the file's name.
+        #[arg(long)]
+        name: Option<String>,
+        /// One new pixel layer per Aseprite layer, hidden ones included.
+        #[arg(long)]
+        split_layers: bool,
+    },
+    /// Add a palette (.hex or .gpl) as a new section.
+    ImportPalette {
+        file: PathBuf,
+        palette: PathBuf,
+        /// Section label; defaults to the file's name.
+        #[arg(long)]
+        section: Option<String>,
     },
 }
 
@@ -112,6 +171,135 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
+        Command::New { file, palette } => {
+            if file.exists() {
+                bail!("{} already exists", file.display());
+            }
+            let preset = match palette.as_str() {
+                "db32" => presets::DB32,
+                "pico8" => presets::PICO8,
+                "endesga32" => presets::ENDESGA32,
+                other => bail!("unknown palette {other:?}: db32, pico8 or endesga32"),
+            };
+            let name = file.file_stem().map_or("untitled".into(), |s| s.to_string_lossy().into_owned());
+            let mut project = Project::new(name);
+            presets::add(&mut project.palette, preset)?;
+            project.add_layer("Art", LayerKind::Pixels(Default::default()));
+            save(&project, &file)?;
+            println!("{} ({} colours)", file.display(), project.palette.len() - 1);
+            Ok(())
+        }
+        Command::Bake { file, out } => {
+            let baked = bake::bake(&load(&file)?);
+            let bytes = baked.to_bytes();
+            std::fs::write(&out, &bytes)?;
+            println!(
+                "{} ({} bytes: {} sprites, {}x{} atlas, {} colours)",
+                out.display(),
+                bytes.len(),
+                baked.sprites.len(),
+                baked.atlas_width,
+                baked.atlas_height,
+                baked.palette.len()
+            );
+            Ok(())
+        }
+        Command::Codegen { file, out, module } => {
+            let baked = bake::load_any(&std::fs::read(&file)?)?;
+            let code = pixelle_build::codegen(&baked, &module, "::bevy_pixelle", &file.display().to_string());
+            match out {
+                Some(out) => std::fs::write(out, code)?,
+                None => print!("{code}"),
+            }
+            Ok(())
+        }
+        Command::ImportPng { file, png, at, layer, sprite } => {
+            let mut project = load(&file)?;
+            let at = parse_at(&at)?;
+            let img = png_io::decode(&std::fs::read(&png)?)?.to_rgba();
+            let id = pixel_layer(&mut project, &layer)?;
+            let mut r = import::Report::default();
+            import::paint_rgba(&mut project, id, at, &img, None, &mut r).map_err(anyhow::Error::msg)?;
+            report(&r);
+            if let Some(name) = sprite {
+                project.sprites.retain(|s| s.name != name);
+                project.sprites.push(Sprite::new(
+                    name,
+                    vec![id],
+                    vec![Frame::new(IRect::new(at.x, at.y, img.w, img.h))],
+                ));
+            }
+            save(&project, &file)?;
+            println!("painted {}x{} at {},{} on {layer:?}", img.w, img.h, at.x, at.y);
+            Ok(())
+        }
+        Command::ImportAseprite { file, aseprite, at, layer, name, split_layers } => {
+            let mut project = load(&file)?;
+            let ase = pixelle_core::aseprite::parse(&std::fs::read(&aseprite)?)?;
+            let name = name.unwrap_or_else(|| {
+                aseprite.file_stem().map_or("sprite".into(), |s| import::snake(&s.to_string_lossy()))
+            });
+            let id = pixel_layer(&mut project, &layer)?;
+            let mut r = import::Report::default();
+            let sprites = import::aseprite(&mut project, &ase, parse_at(&at)?, id, &name, split_layers, &mut r)
+                .map_err(anyhow::Error::msg)?;
+            report(&r);
+            save(&project, &file)?;
+            println!("{} frames; sprites: {}", ase.frames.len(), sprites.join(", "));
+            Ok(())
+        }
+        Command::ImportPalette { file, palette, section } => {
+            let mut project = load(&file)?;
+            let text = std::fs::read_to_string(&palette)?;
+            let colours = match palette.extension().and_then(|e| e.to_str()) {
+                Some("gpl") => import::parse_gpl(&text),
+                _ => import::parse_hex(&text),
+            }
+            .map_err(anyhow::Error::msg)?;
+            let label = section.unwrap_or_else(|| {
+                palette.file_stem().map_or("Palette".into(), |s| s.to_string_lossy().into_owned())
+            });
+            project.palette.begin_section(label.clone());
+            for (name, c) in &colours {
+                project.palette.push(name.clone(), *c)?;
+            }
+            save(&project, &file)?;
+            println!("added {} colours as {label:?}", colours.len());
+            Ok(())
+        }
+    }
+}
+
+fn save(project: &Project, path: &PathBuf) -> Result<()> {
+    let problems = project.validate();
+    for p in &problems {
+        eprintln!("warning: {p}");
+    }
+    format::save_file(project, path).with_context(|| format!("writing {}", path.display()))
+}
+
+fn parse_at(s: &str) -> Result<IVec2> {
+    let v: Vec<i32> = s
+        .split(',')
+        .map(|v| v.trim().parse())
+        .collect::<Result<_, _>>()
+        .context("positions are x,y")?;
+    let [x, y] = v[..] else { bail!("positions are x,y") };
+    Ok(IVec2::new(x, y))
+}
+
+/// The pixel layer with this name, made if there is none.
+fn pixel_layer(project: &mut Project, name: &str) -> Result<pixelle_core::LayerId> {
+    match project.layer_named(name) {
+        Some(l) if l.pixels().is_some() => Ok(l.id),
+        Some(_) => bail!("layer {name:?} is not a pixel layer"),
+        None => Ok(project.add_layer(name, LayerKind::Pixels(Default::default()))),
+    }
+}
+
+fn report(r: &import::Report) {
+    for c in &r.added {
+        println!("added #{:02x}{:02x}{:02x}{:02x} to the palette", c[0], c[1], c[2], c[3]);
     }
 }
 

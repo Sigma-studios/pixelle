@@ -1,16 +1,50 @@
-//! Just enough of the `.aseprite` format to lift layers out of run-2d's sources: normal layers,
-//! raw, compressed and linked cels, the palette, and tags. Groups, tilemaps, blend modes and
-//! opacity are not needed there and are not read.
+//! Just enough of the `.aseprite` format to import art: normal layers, raw, compressed and linked
+//! cels, both palette chunks, tags and frame durations. Group layers are skipped with their
+//! children flattened in; tilemap layers, blend modes and opacity are not read.
 //!
 //! Format reference: <https://github.com/aseprite/aseprite/blob/main/docs/ase-file-specs.md>
 
-use anyhow::{Context, Result, bail, ensure};
+use std::fmt;
+
+/// Why a file could not be read.
+#[derive(Debug)]
+pub struct AseError(pub String);
+
+impl fmt::Display for AseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for AseError {}
+
+type Result<T> = std::result::Result<T, AseError>;
+
+macro_rules! bail {
+    ($($t:tt)*) => { return Err(AseError(format!($($t)*))) };
+}
+
+macro_rules! ensure {
+    ($c:expr, $($t:tt)*) => { if !$c { bail!($($t)*) } };
+}
+
+trait Context<T> {
+    fn context(self, msg: &str) -> Result<T>;
+}
+
+impl<T> Context<T> for Option<T> {
+    fn context(self, msg: &str) -> Result<T> {
+        self.ok_or_else(|| AseError(msg.into()))
+    }
+}
 
 pub struct Ase {
     pub width: u32,
     pub height: u32,
     pub layers: Vec<AseLayer>,
     pub tags: Vec<(String, u32, u32)>,
+    /// Milliseconds each frame shows for.
+    pub durations: Vec<u32>,
     /// `frames[f][layer]`: that layer's picture in that frame as straight RGBA, `width * height`.
     pub frames: Vec<Vec<Vec<[u8; 4]>>>,
 }
@@ -18,6 +52,8 @@ pub struct Ase {
 pub struct AseLayer {
     pub name: String,
     pub visible: bool,
+    /// A group holds no pixels of its own; its children follow it.
+    pub group: bool,
 }
 
 struct Reader<'a> {
@@ -35,13 +71,15 @@ impl<'a> Reader<'a> {
         Ok(self.take(1)?[0])
     }
     fn u16(&mut self) -> Result<u16> {
-        Ok(u16::from_le_bytes(self.take(2)?.try_into()?))
+        let b = self.take(2)?;
+        Ok(u16::from_le_bytes([b[0], b[1]]))
     }
     fn i16(&mut self) -> Result<i16> {
-        Ok(i16::from_le_bytes(self.take(2)?.try_into()?))
+        Ok(self.u16()? as i16)
     }
     fn u32(&mut self) -> Result<u32> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into()?))
+        let b = self.take(4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
     fn string(&mut self) -> Result<String> {
         let n = self.u16()? as usize;
@@ -73,6 +111,7 @@ pub fn parse(bytes: &[u8]) -> Result<Ase> {
 
     let mut layers = Vec::new();
     let mut tags = Vec::new();
+    let mut durations = Vec::new();
     let mut palette = vec![[0u8; 4]; 256];
     // Cels as stored, `None` where a cel links to an earlier frame's.
     let mut cels: Vec<Vec<Option<Cel>>> = Vec::new();
@@ -83,7 +122,7 @@ pub fn parse(bytes: &[u8]) -> Result<Ase> {
         let size = r.u32()? as usize;
         ensure!(r.u16()? == 0xF1FA, "bad frame header");
         let old_chunks = r.u16()? as usize;
-        r.u16()?;
+        durations.push(r.u16()? as u32);
         r.take(2)?;
         let new_chunks = r.u32()? as usize;
         let chunks = if new_chunks == 0 { old_chunks } else { new_chunks };
@@ -99,12 +138,13 @@ pub fn parse(bytes: &[u8]) -> Result<Ase> {
                     // Child level, default size, blend mode, opacity, reserved.
                     r.take(12)?;
                     let name = r.string()?;
-                    if layer_type != 0 {
-                        bail!("layer {name:?} is a group or tilemap, which this reader skips");
+                    if layer_type == 2 {
+                        bail!("layer {name:?} is a tilemap, which this reader does not support");
                     }
                     layers.push(AseLayer {
                         name,
                         visible: flags & 1 != 0,
+                        group: layer_type == 1,
                     });
                 }
                 0x2005 => {
@@ -127,7 +167,7 @@ pub fn parse(bytes: &[u8]) -> Result<Ase> {
                             let raw = r.take(rest)?;
                             let data = if cel_type == 2 {
                                 miniz_oxide::inflate::decompress_to_vec_zlib(raw)
-                                    .map_err(|e| anyhow::anyhow!("bad cel data: {e:?}"))?
+                                    .map_err(|e| AseError(format!("bad cel data: {e:?}")))?
                             } else {
                                 raw.to_vec()
                             };
@@ -235,6 +275,7 @@ pub fn parse(bytes: &[u8]) -> Result<Ase> {
         height,
         layers,
         tags,
+        durations,
         frames,
     })
 }
@@ -245,7 +286,7 @@ impl Ase {
     pub fn visible(&self, frame: usize) -> Vec<[u8; 4]> {
         let mut out = vec![[0u8; 4]; (self.width * self.height) as usize];
         for (l, layer) in self.layers.iter().enumerate() {
-            if !layer.visible {
+            if !layer.visible || layer.group {
                 continue;
             }
             for (o, p) in out.iter_mut().zip(&self.frames[frame][l]) {

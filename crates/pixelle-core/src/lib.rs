@@ -6,9 +6,12 @@
 //! painted grid. Nothing here depends on egui or Bevy, so the editor, the CLI and the game loader
 //! all read the same code.
 
+pub mod aseprite;
+pub mod bake;
 pub mod d4;
 pub mod format;
 pub mod geom;
+pub mod import;
 pub mod grid;
 pub mod layer;
 pub mod pack;

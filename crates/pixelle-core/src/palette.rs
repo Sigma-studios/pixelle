@@ -124,6 +124,47 @@ impl Palette {
         Ok(index)
     }
 
+    /// Insert an entry at the end of the `section`-th section and return its index. Every entry at
+    /// or after that index moves up one, so anything holding indices must be remapped — use
+    /// [`Project::insert_color`](crate::Project::insert_color), which does.
+    pub(crate) fn insert_into_section(&mut self, section: usize, name: String, rgba: Rgba) -> Result<u8, PaletteFull> {
+        if self.entries.len() >= 256 {
+            return Err(PaletteFull);
+        }
+        let at = self.sections[section].start + self.sections[section].len;
+        self.entries.insert(at as usize, PaletteEntry { name, rgba });
+        self.sections[section].len += 1;
+        for s in self.sections.iter_mut().skip(section + 1) {
+            if s.start >= at {
+                s.start += 1;
+            }
+        }
+        Ok(at as u8)
+    }
+
+    /// Remove an entry. Everything after it moves down one; see
+    /// [`Project::remove_color`](crate::Project::remove_color).
+    pub(crate) fn remove(&mut self, index: u8) {
+        let at = index as u16;
+        if at == 0 || at as usize >= self.entries.len() {
+            return;
+        }
+        self.entries.remove(at as usize);
+        for s in &mut self.sections {
+            if s.contains(index) {
+                s.len -= 1;
+            } else if s.start > at {
+                s.start -= 1;
+            }
+        }
+    }
+
+    pub fn rename_section(&mut self, section: usize, label: impl Into<String>) {
+        if let Some(s) = self.sections.get_mut(section) {
+            s.label = label.into();
+        }
+    }
+
     /// Forget sections that ended up holding nothing.
     pub fn drop_empty_sections(&mut self) {
         self.sections.retain(|s| s.len > 0);
@@ -176,5 +217,50 @@ mod tests {
         assert_eq!(p.named("B", "red again"), Some(b));
         assert_eq!(p.section_of(b).unwrap().label, "B");
         assert_eq!(p.find([0, 0, 0, 0], None), None);
+    }
+}
+
+/// Well-known palettes, for starting a project.
+pub mod presets {
+    /// `(name, colours as 0xRRGGBB)`.
+    pub type Preset = (&'static str, &'static [u32]);
+
+    pub const DB32: Preset = (
+        "DawnBringer 32",
+        &[
+            0x000000, 0x222034, 0x45283c, 0x663931, 0x8f563b, 0xdf7126, 0xd9a066, 0xeec39a, 0xfbf236,
+            0x99e550, 0x6abe30, 0x37946e, 0x4b692f, 0x524b24, 0x323c39, 0x3f3f74, 0x306082, 0x5b6ee1,
+            0x639bff, 0x5fcde4, 0xcbdbfc, 0xffffff, 0x9badb7, 0x847e87, 0x696a6a, 0x595652, 0x76428a,
+            0xac3232, 0xd95763, 0xd77bba, 0x8f974a, 0x8a6f30,
+        ],
+    );
+
+    pub const PICO8: Preset = (
+        "PICO-8",
+        &[
+            0x000000, 0x1d2b53, 0x7e2553, 0x008751, 0xab5236, 0x5f574f, 0xc2c3c7, 0xfff1e8, 0xff004d,
+            0xffa300, 0xffec27, 0x00e436, 0x29adff, 0x83769c, 0xff77a8, 0xffccaa,
+        ],
+    );
+
+    pub const ENDESGA32: Preset = (
+        "Endesga 32",
+        &[
+            0xbe4a2f, 0xd77643, 0xead4aa, 0xe4a672, 0xb86f50, 0x733e39, 0x3e2731, 0xa22633, 0xe43b44,
+            0xf77622, 0xfeae34, 0xfee761, 0x63c74d, 0x3e8948, 0x265c42, 0x193c3e, 0x124e89, 0x0099db,
+            0x2ce8f5, 0xffffff, 0xc0cbdc, 0x8b9bb4, 0x5a6988, 0x3a4466, 0x262b44, 0x181425, 0xff0044,
+            0x68386c, 0xb55088, 0xf6757a, 0xe8b796, 0xc28569,
+        ],
+    );
+
+    pub const ALL: [Preset; 3] = [DB32, PICO8, ENDESGA32];
+
+    /// Append a preset as its own section.
+    pub fn add(palette: &mut super::Palette, preset: Preset) -> Result<(), super::PaletteFull> {
+        palette.begin_section(preset.0);
+        for &v in preset.1 {
+            palette.push(format!("#{v:06x}"), [(v >> 16) as u8, (v >> 8) as u8, v as u8, 255])?;
+        }
+        Ok(())
     }
 }

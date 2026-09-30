@@ -17,13 +17,13 @@
 //! sheets change. Before writing, it checks that every sheet comes back out of the file pixel for
 //! pixel, and that the wall terrain reproduces the sheet `cladding.rs` derives at run time.
 
-mod aseprite;
 mod colors;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail, ensure};
+use pixelle_core::aseprite;
 use pixelle_core::layer::{Instance, LayerKind, TerrainLayer};
 use pixelle_core::render::{Renderer, RgbaImage};
 use pixelle_core::tiles::presets::{self, MinimalD4};
