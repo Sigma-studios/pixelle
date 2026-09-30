@@ -30,11 +30,11 @@ impl View {
         pos2(o.x.round(), o.y.round())
     }
 
-    pub fn to_screen(&self, screen: Rect, canvas: Pos2) -> Pos2 {
+    pub fn to_screen(self, screen: Rect, canvas: Pos2) -> Pos2 {
         self.origin(screen) + canvas.to_vec2() * self.zoom
     }
 
-    pub fn to_canvas(&self, screen: Rect, s: Pos2) -> Pos2 {
+    pub fn to_canvas(self, screen: Rect, s: Pos2) -> Pos2 {
         ((s - self.origin(screen)) / self.zoom).to_pos2()
     }
 

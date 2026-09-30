@@ -5,6 +5,8 @@ members = [
     "crates/pixelle-cli",
     "crates/pixelle-build",
     "crates/pixelle-editor",
+    "crates/bevy_pixelle",
+    "examples/showcase",
     "tools/run2d-import",
 ]
 
@@ -16,6 +18,8 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 pixelle-core = { path = "crates/pixelle-core" }
 pixelle-build = { path = "crates/pixelle-build" }
+bevy_pixelle = { path = "crates/bevy_pixelle" }
+bevy = { version = "0.19", default-features = false, features = ["2d"] }
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
 miniz_oxide = "0.8"

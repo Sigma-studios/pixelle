@@ -1,3 +1,5 @@
 /target
 *.png.tmp
 /out
+examples/showcase/assets/hot.pxl
+*.pxlb

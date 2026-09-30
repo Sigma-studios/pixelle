@@ -212,6 +212,7 @@ pub fn parse(bytes: &[u8]) -> Result<Ase> {
                     let first = r.u32()? as usize;
                     let last = r.u32()? as usize;
                     r.take(8)?;
+                    #[allow(clippy::needless_range_loop)] // `i` also bounds-checks the entry.
                     for i in first..=last {
                         let flags = r.u16()?;
                         let c = r.take(4)?;

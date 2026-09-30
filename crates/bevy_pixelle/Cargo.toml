@@ -1,0 +1,11 @@
+[package]
+name = "bevy_pixelle"
+description = "Load Pixelle projects (.pxl) and baked files (.pxlb) as Bevy assets"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+pixelle-core.workspace = true
+bevy.workspace = true
+thiserror = "2"

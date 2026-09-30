@@ -1,6 +1,6 @@
 //! Use a Pixelle project from a game's `build.rs`.
 //!
-//! ```no_run
+//! ```ignore
 //! // build.rs
 //! fn main() {
 //!     pixelle_build::Art::new("assets/art.pxl")

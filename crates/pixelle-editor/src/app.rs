@@ -356,20 +356,17 @@ impl Editor {
             self.selection = None;
             return;
         }
-        match (&self.selected, self.tool) {
-            (Selected::Instance { layer, index }, Tool::Instance) => {
-                let (layer, index) = (*layer, *index);
-                self.edit("Delete instance", None, |p| {
-                    if let Some(LayerKind::Instances(list)) = p.layer_mut(layer).map(|l| &mut l.kind)
-                        && index < list.len()
-                    {
-                        list.remove(index);
-                    }
-                });
-                self.selected = Selected::None;
-                return;
-            }
-            _ => {}
+        if let (Selected::Instance { layer, index }, Tool::Instance) = (&self.selected, self.tool) {
+            let (layer, index) = (*layer, *index);
+            self.edit("Delete instance", None, |p| {
+                if let Some(LayerKind::Instances(list)) = p.layer_mut(layer).map(|l| &mut l.kind)
+                    && index < list.len()
+                {
+                    list.remove(index);
+                }
+            });
+            self.selected = Selected::None;
+            return;
         }
         let (Some(sel), Some(layer)) = (self.selection, self.pixel_layer()) else { return };
         self.doc.begin(layer, "Delete");
@@ -715,13 +712,12 @@ impl Editor {
                 .unwrap_or_else(|| IVec2::new(self.view.center.x as i32, self.view.center.y as i32));
             self.paste(at);
         }
-        if consume(cmd(Key::A)) {
-            if let Some(b) = self.pixel_layer().and_then(|l| self.doc.grid(l)).and_then(|g| g.bounds()) {
+        if consume(cmd(Key::A))
+            && let Some(b) = self.pixel_layer().and_then(|l| self.doc.grid(l)).and_then(|g| g.bounds()) {
                 self.commit_floating();
                 self.selection = Some(b);
                 self.tool = Tool::Select;
             }
-        }
         if consume(cmd(Key::Num0)) {
             self.fit_pending = true;
         }

@@ -788,7 +788,9 @@ impl Editor {
         ui.menu_button("New terrain…", |ui| {
             for (ts, count) in &tilesets {
                 ui.menu_button(format!("on {ts} ({count} tiles)"), |ui| {
-                    let options: [(&str, u32, fn() -> Vec<Rule>); 4] = [
+                    // Name, tiles needed, rules.
+                    type Preset = (&'static str, u32, fn() -> Vec<Rule>);
+                    let options: [Preset; 4] = [
                         ("Minimal D4 (7 tiles)", 7, || {
                             tp::minimal_d4(tp::MinimalD4 { corner: 0, edge: 1, strip_end: 2, strip: 3, interior: 4, inside: 5, double_inside: 6 })
                         }),

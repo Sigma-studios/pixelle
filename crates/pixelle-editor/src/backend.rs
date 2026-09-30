@@ -37,6 +37,8 @@ pub trait CanvasBackend {
     fn thumbnail(&mut self, ctx: &egui::Context, project: &Project, revision: u64, bounds: IRect, max: u32) -> Option<TextureId>;
 }
 
+type Sized = (TextureHandle, [u32; 2]);
+
 const TILE: i32 = 64;
 /// Tiles composited per frame, so a big jump never stalls the UI.
 const BUDGET: usize = 24;
@@ -47,7 +49,8 @@ const KEEP: usize = 2048;
 pub struct CpuTiles {
     /// `None`: rendered, and empty.
     tiles: HashMap<(i32, i32), Option<TextureHandle>>,
-    frames: HashMap<(String, usize), Option<(TextureHandle, [u32; 2])>>,
+    /// `(sprite, frame)` → the frame's texture and size, `None` if it is empty.
+    frames: HashMap<(String, usize), Option<Sized>>,
     overlays: HashMap<u64, TextureHandle>,
     tile_pics: HashMap<(String, u32, D4), TextureHandle>,
     thumb: Option<(u64, IRect, TextureHandle)>,

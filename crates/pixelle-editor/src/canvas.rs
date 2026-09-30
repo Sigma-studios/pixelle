@@ -347,11 +347,10 @@ impl Editor {
                 }
                 self.doc.end();
             }
-            Drag::Select { start } => {
-                if start == px && self.selection.is_some_and(|s| s.w == 1 && s.h == 1) {
+            Drag::Select { start }
+                if start == px && self.selection.is_some_and(|s| s.w == 1 && s.h == 1) => {
                     self.selection = None;
                 }
-            }
             Drag::NewSprite { start } => {
                 let Some(end) = self.shape_end.take() else {
                     // A click on nothing: deselect.
