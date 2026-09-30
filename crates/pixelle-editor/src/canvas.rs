@@ -419,12 +419,32 @@ impl Editor {
         }
     }
 
+    /// Flood the region under `px` on the active layer.
+    ///
+    /// A region of a colour is finite, so it always fills whole. Transparent space is the one
+    /// kind that can go on forever: it fills when something encloses it, and otherwise nothing
+    /// happens and the status bar says so. Inside a selection, the selection is the boundary,
+    /// which is how to fill open space on purpose.
     fn fill(&mut self, px: IVec2, secondary: bool, dither: bool) {
+        self.commit_floating();
         let Some(layer) = self.need_pixel_layer() else { return };
-        let bounds = self.frame_at(px).map(|(.., r)| r).unwrap_or_else(|| self.view.visible(self.canvas_rect));
-        let region = {
-            let grid = self.doc.grid(layer);
-            tools::flood(px, bounds, |p| grid.map_or(0, |g| g.get(p)))
+        let grid = self.doc.grid(layer);
+        let get = |p: IVec2| grid.map_or(0, |g| g.get(p));
+        let region = match self.selection.filter(|s| s.contains(px)) {
+            Some(sel) => tools::flood(px, sel, get),
+            None => {
+                // Everything drawn on the layer, one pixel wider: a region that reaches that
+                // margin is open to the rest of the canvas.
+                let content = grid.and_then(|g| g.bounds()).unwrap_or_default();
+                let bounds = content.union(&IRect::new(px.x, px.y, 1, 1)).grow(1);
+                let region = tools::flood(px, bounds, get);
+                let edge = |p: &IVec2| p.x == bounds.x || p.y == bounds.y || p.x == bounds.max().x - 1 || p.y == bounds.max().y - 1;
+                if get(px) == 0 && region.iter().any(edge) {
+                    self.say("That space is open to the rest of the canvas: close it off, or select an area to fill");
+                    return;
+                }
+                region
+            }
         };
         let (a, b) = if secondary { (self.secondary, self.primary) } else { (self.primary, self.secondary) };
         self.doc.begin(layer, "Fill");
@@ -908,21 +928,47 @@ mod tests {
     }
 
     #[test]
-    fn fill_stays_inside_the_frame_under_it() {
+    fn fill_fills_enclosed_space_and_whole_regions() {
         let mut ed = editor();
         let l = art(&ed);
-        ed.edit("sprite", None, |p| p.sprites.push(Sprite::new("s", vec![l], vec![Frame::new(IRect::new(0, 0, 4, 4))])));
+        // A 6x6 ring, open nowhere.
+        ed.tool = Tool::Rect;
+        ed.primary = 2;
+        drag(&mut ed, &[(0, 0), (5, 5)], PointerButton::Primary, Modifiers::NONE);
         ed.tool = Tool::Fill;
         ed.primary = 9;
-        click(&mut ed, 1, 1);
-        assert_eq!(ed.doc.get(l, IVec2::new(3, 3)), 9);
-        assert_eq!(ed.doc.get(l, IVec2::new(4, 0)), 0);
+        click(&mut ed, 2, 2);
+        assert_eq!(ed.doc.get(l, IVec2::new(1, 1)), 9);
+        assert_eq!(ed.doc.get(l, IVec2::new(4, 4)), 9);
+        assert_eq!(ed.doc.get(l, IVec2::new(6, 6)), 0, "outside stays empty");
+        // The ring itself is a region of a colour: all of it goes, however far it runs.
+        ed.primary = 5;
+        click(&mut ed, 0, 3);
+        assert_eq!(ed.doc.get(l, IVec2::new(5, 0)), 5);
+        assert_eq!(ed.doc.get(l, IVec2::new(2, 2)), 9);
         // Shift dithers with the secondary.
         ed.secondary = 4;
         ed.primary = 8;
-        drag(&mut ed, &[(0, 0)], PointerButton::Primary, Modifiers::SHIFT);
-        assert_eq!(ed.doc.get(l, IVec2::new(0, 0)), 8);
-        assert_eq!(ed.doc.get(l, IVec2::new(1, 0)), 4);
+        drag(&mut ed, &[(1, 1)], PointerButton::Primary, Modifiers::SHIFT);
+        assert_eq!(ed.doc.get(l, IVec2::new(2, 2)), 8);
+        assert_eq!(ed.doc.get(l, IVec2::new(1, 2)), 4);
+    }
+
+    #[test]
+    fn fill_leaves_open_space_alone_unless_it_is_selected() {
+        let mut ed = editor();
+        let l = art(&ed);
+        ed.tool = Tool::Line;
+        ed.primary = 2;
+        drag(&mut ed, &[(0, 0), (0, 5)], PointerButton::Primary, Modifiers::NONE);
+        ed.tool = Tool::Fill;
+        click(&mut ed, 3, 3);
+        assert_eq!(ed.doc.get(l, IVec2::new(3, 3)), 0);
+        assert!(ed.doc.can_undo() == Some("Line"));
+        ed.selection = Some(IRect::new(1, 1, 3, 3));
+        click(&mut ed, 2, 2);
+        assert_eq!(ed.doc.get(l, IVec2::new(3, 3)), 2);
+        assert_eq!(ed.doc.get(l, IVec2::new(4, 4)), 0);
     }
 
     #[test]

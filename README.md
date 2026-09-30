@@ -42,7 +42,7 @@ cargo run -p pixelle-cli -- info out/run2d.pxl
 - **Selections:** ⌘C / ⌘X / ⌘V; arrows nudge; Enter puts pixels down; Esc deselects.
 - **Instances:** `F` flips; `[` and `]` step through frames.
 
-Animations play beside their strips on the canvas. Undo lasts for the session. Unsaved work is autosaved beside the file every 30 s and offered back on reopen. A file changed by something else is reloaded, or you're asked first if you have unsaved changes.
+Fill floods the whole connected region; transparent space fills only when enclosed or inside a selection, since the canvas is infinite. Animations play beside their strips on the canvas. Undo lasts for the session. Unsaved work is autosaved beside the file every 30 s and offered back on reopen. A file changed by something else is reloaded, or you're asked first if you have unsaved changes.
 
 `--screenshot out.png` (plus `--view`, `--zoom`, `--select`, `--tool`, `--layer`) renders the editor once and quits, for scripted checks.
 

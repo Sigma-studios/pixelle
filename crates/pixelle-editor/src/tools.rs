@@ -72,7 +72,7 @@ impl Tool {
             Tool::Eraser => "Drag to erase on the active layer",
             Tool::Line => "Drag a line · Right: secondary",
             Tool::Rect => "Drag a rectangle · Shift: filled",
-            Tool::Fill => "Fill a region (bounded by the sprite frame under the cursor, else the view) · Shift: dither",
+            Tool::Fill => "Fill the region under the cursor (open space only inside a selection) · Shift: dither",
             Tool::Picker => "Left: primary · Right: secondary",
             Tool::Select => "Drag to select · drag inside to move · ⌘C/⌘X/⌘V · arrows nudge · Enter commits",
             Tool::Terrain => "Paint the active terrain on a terrain layer · Right: erase",
