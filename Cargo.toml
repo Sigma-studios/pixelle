@@ -4,6 +4,7 @@ members = [
     "crates/pixelle-core",
     "crates/pixelle-cli",
     "crates/pixelle-build",
+    "crates/pixelle-editor",
     "tools/run2d-import",
 ]
 

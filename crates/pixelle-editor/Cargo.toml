@@ -1,0 +1,16 @@
+[package]
+name = "pixelle-editor"
+description = "The Pixelle editor: an infinite indexed canvas for game art"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "pixelle-editor"
+path = "src/main.rs"
+
+[dependencies]
+pixelle-core.workspace = true
+eframe = "0.36"
+rfd = "0.17"
+anyhow.workspace = true
