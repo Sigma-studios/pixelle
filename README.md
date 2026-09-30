@@ -16,11 +16,11 @@ Everything lives in one `.pxl` file.
 
 | Path | What |
 |---|---|
-| `crates/pixelle-core` | Data model, compositing, D4 terrain rules (plus `edge16`/`blob47` presets), atlas packing, `.pxl` and baked `.pxlb` formats, PNG/Aseprite/palette import. No UI or engine dependencies. |
+| `crates/pixelle-core` | Data model, compositing, terrain rules (whole tiles in 8 orientations, with a quarter-tile fallback; `minimal_d4`, `edge16`, `blob47` presets), atlas packing, `.pxl` and baked `.pxlb` formats, PNG/Aseprite/palette import. No UI or engine dependencies. |
 | `crates/pixelle-editor` | The editor (eframe/egui). The canvas renders through a swappable `CanvasBackend`; today that is CPU tiles. |
 | `crates/pixelle-cli` | `pixelle`: `new`, `info`, `render`, `pack`, `bake`, `codegen`, `import-png`, `import-aseprite`, `import-palette`. |
 | `crates/pixelle-build` | For build.rs: bakes the runtime file and generates typed constants (`art::weapons::SHOTGUN`, `art::player::poses::CROUCH`, `art::points::MUZZLE`, `art::palette::clothing::RUST`). |
-| `crates/bevy_pixelle` | Bevy 0.19 asset loader for `.pxl` and `.pxlb`. Provides `PixelleSprite` (frames, recolouring, hot reload), `PixelleAnimation`, and anchor offsets. |
+| `crates/bevy_pixelle` | Bevy 0.19 asset loader for `.pxl` and `.pxlb`. Provides `PixelleSprite` (frames, recolouring, hot reload), `PixelleAnimation`, anchor offsets, and runtime terrain autotiling (`art.terrain(..).cell(..)`). |
 | `examples/showcase` | run-2d's art in Bevy, driven entirely by the generated names. |
 | `tools/run2d-import` | Generates `run2d.pxl` from the run-2d game, with pixel-exact round-trip checks. |
 
@@ -64,14 +64,23 @@ commands.spawn((
 ));
 ```
 
+Grid maps made at run time (a level editor in the game) are clad by the file's own terrain rules:
+
+```rust
+let walls = art.terrain(art::terrains::WALLS).unwrap();
+for piece in walls.cell(|d| is_ground(cell + d)) {          // d in cells, y up
+    commands.spawn((walls.sprite(&piece), Transform::from_translation((centre + piece.offset).extend(z))));
+}
+```
+
 Only the project is tracked. The baked file is derived at build time, so don't commit it.
 
 ## File formats
 
 - **`.pxl`** (the project):
-  - `b"PXLL"` magic, then a u16 version and u32 flags (both little-endian), then the project, postcard-encoded.
+  - `b"PXLL"` magic, then a u16 version (2; version 1 files still load) and u32 flags (both little-endian), then the project, postcard-encoded.
   - Pixels are stored as sparse 64×64 chunks, each deflate-compressed.
   - `pixelle info --ron` dumps everything except the pixels as readable text.
 - **`.pxlb`** (the baked runtime file):
-  - `b"PXLB"`, version and flags, then the palette, recolour slots, a deflated indexed atlas, and each sprite's frames, timings, anchors and tags.
-  - run-2d's art bakes to about 5 KB.
+  - `b"PXLB"`, version and flags, then the palette, recolour slots, a deflated indexed atlas, and each sprite's frames, timings, anchors and tags, and each terrain's rules and tiles.
+  - run-2d's art bakes to about 6 KB.

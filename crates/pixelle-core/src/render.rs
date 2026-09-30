@@ -11,6 +11,7 @@ use crate::geom::{IRect, IVec2};
 use crate::layer::{Instance, Layer, LayerId, LayerKind};
 use crate::palette::Palette;
 use crate::project::Project;
+use crate::tiles::Choice;
 
 /// How deep instances of sprites whose layers hold instances may nest before drawing stops.
 const MAX_DEPTH: u32 = 4;
@@ -50,6 +51,17 @@ impl Indexed {
             for x in 0..self.w {
                 let to = t.apply(IVec2::new(x as i32, y as i32), self.w, self.h);
                 out.set(to.x as u32, to.y as u32, self.get(x, y));
+            }
+        }
+        out
+    }
+
+    /// The `w`×`h` picture at `(x, y)` of this one.
+    pub fn crop(&self, x: u32, y: u32, w: u32, h: u32) -> Indexed {
+        let mut out = Indexed::new(w, h);
+        for dy in 0..h.min(self.h.saturating_sub(y)) {
+            for dx in 0..w.min(self.w.saturating_sub(x)) {
+                out.set(dx, dy, self.get(x + dx, y + dy));
             }
         }
         out
@@ -278,12 +290,23 @@ impl<'a> Renderer<'a> {
                         else {
                             continue;
                         };
-                        let Some((tile, orient)) = terrain.resolve(|d| t.cells.get(cell + d) == v)
-                        else {
+                        let Some(choice) = terrain.choose(|d| t.cells.get(cell + d) == v) else {
                             continue;
                         };
-                        let pic = self.tile(ts, tile, depth).transformed(orient);
-                        out.blit(&pic, cell * s - rect.min());
+                        match choice {
+                            Choice::Whole { tile, transform } => {
+                                let pic = self.tile(ts, tile, depth).transformed(transform);
+                                out.blit(&pic, cell * s - rect.min());
+                            }
+                            Choice::Quarters(quarters) => {
+                                let h = s / 2;
+                                for (q, corner) in quarters.iter().zip([IVec2::ZERO, IVec2::new(h, 0), IVec2::new(0, h), IVec2::new(h, h)]) {
+                                    let whole = self.tile(ts, q.tile, depth).transformed(q.transform);
+                                    let piece = whole.crop(0, 0, h as u32, h as u32).transformed(q.place);
+                                    out.blit(&piece, cell * s + corner - rect.min());
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -370,6 +393,7 @@ mod tests {
             tileset: "ts".into(),
             rules: presets::horizontal_run(0, 0, 0, 0),
             fallback: None,
+            quarters: Vec::new(),
         });
         let mut cells = Grid::new();
         cells.set(IVec2::new(5, 0), 1);

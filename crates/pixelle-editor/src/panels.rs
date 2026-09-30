@@ -3,7 +3,7 @@
 use eframe::egui::{self, Color32, RichText, Sense, Stroke, StrokeKind, vec2};
 use pixelle_core::layer::{Instance, LayerKind, TerrainLayer};
 use pixelle_core::palette::presets;
-use pixelle_core::tiles::{Cond, Rule, Terrain, Tileset, presets as tp};
+use pixelle_core::tiles::{Cond, QuarterRule, Rule, Terrain, Tileset, presets as tp};
 use pixelle_core::{Bookmark, D4, Frame, Grid, IRect, IVec2, Project, SwapSlot};
 
 use crate::app::{Editor, Selected};
@@ -788,21 +788,21 @@ impl Editor {
         ui.menu_button("New terrain…", |ui| {
             for (ts, count) in &tilesets {
                 ui.menu_button(format!("on {ts} ({count} tiles)"), |ui| {
-                    // Name, tiles needed, rules.
-                    type Preset = (&'static str, u32, fn() -> Vec<Rule>);
+                    // Name, tiles needed, whole-tile rules, quarter rules.
+                    type Preset = (&'static str, u32, fn() -> Vec<Rule>, fn() -> Vec<QuarterRule>);
+                    const ROLES: tp::MinimalD4 = tp::MinimalD4 { corner: 0, edge: 1, strip_end: 2, strip: 3, interior: 4, inside: 5, double_inside: 6 };
                     let options: [Preset; 4] = [
-                        ("Minimal D4 (7 tiles)", 7, || {
-                            tp::minimal_d4(tp::MinimalD4 { corner: 0, edge: 1, strip_end: 2, strip: 3, interior: 4, inside: 5, double_inside: 6 })
-                        }),
-                        ("Edge 16", 16, tp::edge16),
-                        ("Blob 47", 47, tp::blob47),
-                        ("Horizontal run (3 tiles)", 3, || tp::horizontal_run(0, 1, 2, 1)),
+                        ("Minimal D4 + quarters (7 tiles)", 7, || tp::minimal_d4(ROLES), || tp::quarters_d4(ROLES)),
+                        ("Edge 16", 16, tp::edge16, Vec::new),
+                        ("Blob 47", 47, tp::blob47, Vec::new),
+                        ("Horizontal run (3 tiles)", 3, || tp::horizontal_run(0, 1, 2, 1), Vec::new),
                     ];
-                    for (label, need, rules) in options {
+                    for (label, need, rules, quarters) in options {
                         let enabled = *count >= need;
                         if ui.add_enabled(enabled, egui::Button::new(label)).on_disabled_hover_text(format!("needs {need} tiles")).clicked() {
                             let name = format!("{ts} terrain");
-                            let t = Terrain { name, tileset: ts.clone(), rules: rules(), fallback: None };
+                            let mut t = Terrain::new(name, ts.clone(), rules());
+                            t.quarters = quarters();
                             self.edit("New terrain", None, |p| p.terrains.push(t));
                             let i = self.doc.project.terrains.len() - 1;
                             self.selected = Selected::Terrain(i);
@@ -898,6 +898,66 @@ impl Editor {
                             });
                         }
                     });
+                });
+            });
+        }
+        // Quarter rules: the fallback that draws a cell a corner at a time.
+        ui.separator();
+        ui.label(RichText::new("Quarters, where no rule matches. Written for the top-left quarter: the neighbour above, beside, and off the corner.").small().weak());
+        let cycle = |c: Cond| match c {
+            Cond::Any => Cond::Same,
+            Cond::Same => Cond::NotSame,
+            Cond::NotSame => Cond::Any,
+        };
+        let glyph = |c: Cond| match c {
+            Cond::Any => "?",
+            Cond::Same => "#",
+            Cond::NotSame => ".",
+        };
+        for (qi, q) in t.quarters.iter().enumerate() {
+            ui.horizontal(|ui| {
+                for (label, cond, which) in [("above", q.vertical, 0), ("beside", q.horizontal, 1), ("corner", q.diagonal, 2)] {
+                    if ui.add_sized([22.0, 18.0], egui::Button::new(glyph(cond))).on_hover_text(label).clicked() {
+                        let next = cycle(cond);
+                        self.edit("Edit quarter", None, |p| {
+                            let r = &mut p.terrains[ti].quarters[qi];
+                            match which {
+                                0 => r.vertical = next,
+                                1 => r.horizontal = next,
+                                _ => r.diagonal = next,
+                            }
+                        });
+                    }
+                }
+                ui.label(RichText::new(&q.name).small());
+                let mut tile = q.tile;
+                if ui.add(egui::DragValue::new(&mut tile).prefix("tile ").range(0..=count.saturating_sub(1))).changed() {
+                    self.edit("Edit quarter", Some(&format!("quarter-tile-{ti}-{qi}")), |p| p.terrains[ti].quarters[qi].tile = tile);
+                }
+                if let Some(tex) = self.backend.tile(ui.ctx(), &self.doc.project, &t.tileset, q.tile, q.transform) {
+                    // The top-left quarter of the oriented tile is what gets drawn.
+                    ui.add(egui::Image::new((tex, vec2(12.0, 12.0))).uv(egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(0.5, 0.5))));
+                }
+                let mut tr = q.transform;
+                if transform_combo(ui, ("quarter-t", ti, qi), &mut tr) {
+                    self.edit("Edit quarter", None, |p| p.terrains[ti].quarters[qi].transform = tr);
+                }
+                if ui.small_button("×").clicked() {
+                    self.edit("Remove quarter", None, |p| {
+                        p.terrains[ti].quarters.remove(qi);
+                    });
+                }
+            });
+        }
+        if ui.button("+ Quarter").clicked() {
+            self.edit("Add quarter", None, |p| {
+                p.terrains[ti].quarters.push(QuarterRule {
+                    name: "quarter".into(),
+                    vertical: Cond::Any,
+                    horizontal: Cond::Any,
+                    diagonal: Cond::Any,
+                    tile: 0,
+                    transform: D4::IDENTITY,
                 });
             });
         }

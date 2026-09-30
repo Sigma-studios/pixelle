@@ -149,16 +149,27 @@ pub fn codegen(baked: &Baked, module: &str, crate_path: &str, source: &str) -> S
     }
     write_node(&mut out, &root, 1);
 
-    let mut names = |title: &str, doc: &str, items: &mut dyn Iterator<Item = String>| {
+    let names = |out: &mut String, title: &str, doc: &str, items: &mut dyn Iterator<Item = String>| {
         let _ = writeln!(out, "    /// {doc}\n    pub mod {title} {{");
         for n in items {
             let _ = writeln!(out, "        pub const {}: &str = {n:?};", const_ident(&n));
         }
         let _ = writeln!(out, "    }}");
     };
-    names("points", "Anchor point names used by any frame.", &mut points.into_iter());
-    names("rects", "Named rectangle names used by any frame.", &mut rects.into_iter());
+    names(&mut out, "points", "Anchor point names used by any frame.", &mut points.into_iter());
+    let _ = writeln!(out, "    /// Terrains, for autotiling grids at run time.\n    pub mod terrains {{");
+    for t in &baked.terrains {
+        let _ = writeln!(
+            out,
+            "        pub const {}: {crate_path}::TerrainId = {crate_path}::TerrainId({:?});",
+            const_ident(&t.name),
+            t.name
+        );
+    }
+    let _ = writeln!(out, "    }}");
+    names(&mut out, "rects", "Named rectangle names used by any frame.", &mut rects.into_iter());
     names(
+        &mut out,
         "swaps",
         "Recolour slots.",
         &mut baked.swaps.iter().map(|s| s.name.clone()),

@@ -714,25 +714,30 @@ impl Import {
             count: 3,
             layers: art,
         });
+        // `cladding.rs` `clad_terrain`: whole frames where one is exactly right, quarters
+        // everywhere else. `verify` checks every neighbourhood against it.
+        let roles = MinimalD4 {
+            corner: 0,
+            edge: 1,
+            strip_end: 2,
+            strip: 3,
+            interior: 4,
+            inside: 5,
+            double_inside: 6,
+        };
         self.p.terrains.push(Terrain {
             name: "walls".into(),
             tileset: "walls".into(),
-            rules: presets::minimal_d4(MinimalD4 {
-                corner: 0,
-                edge: 1,
-                strip_end: 2,
-                strip: 3,
-                interior: 4,
-                inside: 5,
-                double_inside: 6,
-            }),
-            fallback: Some(4),
+            rules: presets::minimal_d4(roles),
+            fallback: None,
+            quarters: presets::quarters_d4(roles),
         });
         self.p.terrains.push(Terrain {
             name: "platforms".into(),
             tileset: "platforms".into(),
             rules: presets::horizontal_run(0, 1, 2, 1),
             fallback: None,
+            quarters: Vec::new(),
         });
     }
 
@@ -975,6 +980,44 @@ impl Import {
             ensure!(normalise(&got) == normalise(&want), "walls/sheet frame {f} ({})", WALL_FRAMES[f]);
         }
 
+        // The walls terrain draws every neighbourhood exactly as run-2d's grid cladding does.
+        let derived: Vec<RgbaImage> = (0..10)
+            .map(|f| {
+                let src = if f < 7 { f } else { [1, 2, 3][f - 7] };
+                let img = crop(walls, IRect::new(src as i32 * TILE, 0, TILE as u32, TILE as u32));
+                if f >= 7 { transpose(&img) } else { img }
+            })
+            .collect();
+        let walls_id = self.p.terrain_id("walls").context("walls terrain")?;
+        let mut scratch = self.p.clone();
+        let probe = scratch.add_layer("probe", LayerKind::Terrain(TerrainLayer { cell_size: TILE as u32, cells: Grid::new() }));
+        // Far from anything else on the canvas.
+        let origin = IVec2::new(-1000, -1000);
+        for mask in 0..=255u8 {
+            let solid = |d: IVec2| {
+                let slot = pixelle_core::tiles::NEIGHBOURS.iter().position(|n| *n == d);
+                slot.is_none_or(|s| mask & (1 << s) != 0)
+            };
+            if let LayerKind::Terrain(t) = &mut scratch.layer_mut(probe).unwrap().kind {
+                t.cells = Grid::new();
+                for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        if solid(IVec2::new(dx, dy)) {
+                            t.cells.set(origin + IVec2::new(dx, dy), walls_id);
+                        }
+                    }
+                }
+            }
+            let at = origin * TILE;
+            let ours = Renderer::new(&scratch)
+                .indexed(IRect::new(at.x, at.y, TILE as u32, TILE as u32), &[probe])
+                .to_rgba(&scratch.palette);
+            // y up, as run-2d asks: open(dc, dr).
+            let open = |dc: i32, dr: i32| !solid(IVec2::new(dc, -dr));
+            let theirs = run2d_cell(&derived, open);
+            ensure!(normalise(&ours) == normalise(&theirs), "walls terrain differs from cladding.rs for neighbourhood {mask:08b}");
+        }
+
         // Every frame of every sheet is reachable by some sprite name.
         let mut covered: BTreeMap<(i32, i32), ()> = BTreeMap::new();
         for s in &self.p.sprites {
@@ -1053,4 +1096,90 @@ fn normalise(img: &RgbaImage) -> Vec<[u8; 4]> {
         .chunks_exact(4)
         .map(|c| if c[3] == 0 { [0; 4] } else { [c[0], c[1], c[2], c[3]] })
         .collect()
+}
+
+/// `cladding.rs` at e59b281: `Around`, `whole_frame`, `quarter` and the drawing in `clad_terrain`,
+/// ported to produce the picture of one cell. `open(dc, dr)` is whether the neighbour that many
+/// columns across and rows up is open.
+fn run2d_cell(sheet: &[RgbaImage], open: impl Fn(i32, i32) -> bool) -> RgbaImage {
+    const CORNER: usize = 0;
+    const TOP: usize = 1;
+    const COLUMN_HEAD: usize = 2;
+    const COLUMN_BODY: usize = 3;
+    const INTERIOR: usize = 4;
+    const INSIDE: usize = 5;
+    const DOUBLE_INSIDE: usize = 6;
+    const LEFT: usize = 7;
+    const BAR_END: usize = 8;
+    const BAR_BODY: usize = 9;
+    let (n, s, e, w) = (open(0, 1), open(0, -1), open(1, 0), open(-1, 0));
+    let (ne, nw, se, sw) = (open(1, 1), open(-1, 1), open(1, -1), open(-1, -1));
+    let whole = match (n, s, w, e) {
+        (false, false, false, false) => match (ne, nw, se, sw) {
+            (false, false, false, false) => Some((INTERIOR, false, false)),
+            (true, false, false, false) => Some((INSIDE, false, false)),
+            (false, true, false, false) => Some((INSIDE, true, false)),
+            (false, false, true, false) => Some((INSIDE, false, true)),
+            (false, false, false, true) => Some((INSIDE, true, true)),
+            (true, true, false, false) => Some((DOUBLE_INSIDE, false, false)),
+            (false, false, true, true) => Some((DOUBLE_INSIDE, false, true)),
+            _ => None,
+        },
+        (true, false, false, false) if !se && !sw => Some((TOP, false, false)),
+        (false, true, false, false) if !ne && !nw => Some((TOP, false, true)),
+        (false, false, true, false) if !ne && !se => Some((LEFT, false, false)),
+        (false, false, false, true) if !nw && !sw => Some((LEFT, true, false)),
+        (true, false, true, false) if !se => Some((CORNER, false, false)),
+        (true, false, false, true) if !sw => Some((CORNER, true, false)),
+        (false, true, true, false) if !ne => Some((CORNER, false, true)),
+        (false, true, false, true) if !nw => Some((CORNER, true, true)),
+        (false, false, true, true) => Some((COLUMN_BODY, false, false)),
+        (true, true, false, false) => Some((BAR_BODY, false, false)),
+        (true, false, true, true) => Some((COLUMN_HEAD, false, false)),
+        (false, true, true, true) => Some((COLUMN_HEAD, false, true)),
+        (true, true, true, false) => Some((BAR_END, false, false)),
+        (true, true, false, true) => Some((BAR_END, true, false)),
+        _ => None,
+    };
+    if let Some((f, fx, fy)) = whole {
+        return flip(&sheet[f], fx, fy);
+    }
+    let quarter = |vertical: bool, horizontal: bool, diagonal: bool| match (vertical, horizontal, diagonal) {
+        (true, true, _) => (CORNER, false),
+        (true, false, _) => (TOP, false),
+        (false, true, _) => (LEFT, false),
+        (false, false, true) => (INSIDE, true),
+        (false, false, false) => (INTERIOR, false),
+    };
+    let half = TILE as u32 / 2;
+    let mut out = RgbaImage::new(TILE as u32, TILE as u32);
+    for (vertical, horizontal, diagonal, right, bottom) in
+        [(n, w, nw, false, false), (n, e, ne, true, false), (s, w, sw, false, true), (s, e, se, true, true)]
+    {
+        let (f, mirrored) = quarter(vertical, horizontal, diagonal);
+        let from = if mirrored { half } else { 0 };
+        let piece = flip(&crop(&sheet[f], IRect::new(from as i32, 0, half, half)), right != mirrored, bottom);
+        let (ox, oy) = (if right { half } else { 0 }, if bottom { half } else { 0 });
+        for y in 0..half {
+            for x in 0..half {
+                let s = ((y * half + x) * 4) as usize;
+                let d = (((oy + y) * TILE as u32 + ox + x) * 4) as usize;
+                out.px[d..d + 4].copy_from_slice(&piece.px[s..s + 4]);
+            }
+        }
+    }
+    out
+}
+
+fn flip(img: &RgbaImage, fx: bool, fy: bool) -> RgbaImage {
+    let mut out = RgbaImage::new(img.w, img.h);
+    for y in 0..img.h {
+        for x in 0..img.w {
+            let (sx, sy) = (if fx { img.w - 1 - x } else { x }, if fy { img.h - 1 - y } else { y });
+            let s = ((sy * img.w + sx) * 4) as usize;
+            let d = ((y * img.w + x) * 4) as usize;
+            out.px[d..d + 4].copy_from_slice(&img.px[s..s + 4]);
+        }
+    }
+    out
 }

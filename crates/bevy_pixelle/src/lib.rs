@@ -49,6 +49,16 @@ impl AsRef<str> for SpriteId {
     }
 }
 
+/// A terrain's name, as `pixelle-build` generates it: `art::terrains::WALLS`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TerrainId(pub &'static str);
+
+impl AsRef<str> for TerrainId {
+    fn as_ref(&self) -> &str {
+        self.0
+    }
+}
+
 pub struct PixellePlugin;
 
 impl Plugin for PixellePlugin {
@@ -121,6 +131,11 @@ impl PixelleArt {
         atlas_image(&self.baked, self.baked.atlas_rgba_swapped(swaps))
     }
 
+    /// A terrain, for autotiling a grid at run time.
+    pub fn terrain(&self, name: impl AsRef<str>) -> Option<TerrainRef<'_>> {
+        Some(TerrainRef { terrain: self.baked.terrain(name.as_ref())?, atlas: &self.atlas })
+    }
+
     /// The baked data underneath, for anything this API does not cover.
     pub fn baked(&self) -> &Baked {
         &self.baked
@@ -185,6 +200,71 @@ impl FrameRef<'_> {
     pub fn rect(&self, name: &str) -> Option<URect> {
         let r = self.frame.rects.get(name)?;
         Some(URect::new(r.x as u32, r.y as u32, r.x as u32 + r.w, r.y as u32 + r.h))
+    }
+}
+
+/// A terrain of a [`PixelleArt`].
+#[derive(Clone, Copy)]
+pub struct TerrainRef<'a> {
+    terrain: &'a pixelle_core::bake::BakedTerrain,
+    atlas: &'a Handle<Image>,
+}
+
+/// One sprite of a terrain cell.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TerrainPiece {
+    /// Where to sample in the atlas, in pixels.
+    pub rect: URect,
+    /// From the cell's centre to the piece's, `y` up.
+    pub offset: Vec2,
+    pub size: Vec2,
+    pub flip_x: bool,
+    pub flip_y: bool,
+}
+
+impl TerrainRef<'_> {
+    /// The size of a cell in pixels.
+    pub fn cell_size(&self) -> u32 {
+        self.terrain.tile_size
+    }
+
+    /// The pieces that draw a cell, given which neighbours are the same terrain: `same(offset)`
+    /// with `offset` in cells, **`y` up**. Answer for cells off the edge of your grid however the
+    /// world wants — run-2d calls the floor and the side walls ground.
+    pub fn cell(&self, same: impl Fn(IVec2) -> bool) -> Vec<TerrainPiece> {
+        let s = self.terrain.tile_size as f32;
+        self.terrain
+            .cell(|d| same(IVec2::new(d.x, -d.y)))
+            .into_iter()
+            .map(|p| {
+                let r = p.source;
+                let at = p.at;
+                TerrainPiece {
+                    rect: URect::new(r.x as u32, r.y as u32, r.x as u32 + r.w, r.y as u32 + r.h),
+                    offset: Vec2::new(at.x as f32 + at.w as f32 / 2.0 - s / 2.0, s / 2.0 - (at.y as f32 + at.h as f32 / 2.0)),
+                    size: Vec2::new(at.w as f32, at.h as f32),
+                    flip_x: p.flip_x,
+                    flip_y: p.flip_y,
+                }
+            })
+            .collect()
+    }
+
+    /// A piece as a sprite of the atlas.
+    pub fn sprite(&self, piece: &TerrainPiece) -> Sprite {
+        Sprite {
+            image: self.atlas.clone(),
+            rect: Some(Rect::new(
+                piece.rect.min.x as f32,
+                piece.rect.min.y as f32,
+                piece.rect.max.x as f32,
+                piece.rect.max.y as f32,
+            )),
+            custom_size: Some(piece.size),
+            flip_x: piece.flip_x,
+            flip_y: piece.flip_y,
+            ..default()
+        }
     }
 }
 

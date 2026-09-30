@@ -2,7 +2,7 @@
 //!
 //! Everything here is looked up by name through the generated `art` module — no frame indices,
 //! no pixel constants. Weapons sit in hands by the file's own `hand` and `trigger` points; players
-//! are recoloured through its recolour slots; the walls use the transposed frames the file bakes.
+//! are recoloured through its recolour slots; a grid map is autotiled by its walls terrain.
 //!
 //! `cargo run -p showcase` loads the project (edit it in the editor and it reloads);
 //! `cargo run -p showcase --release` loads the baked `run2d.pxlb`.
@@ -114,34 +114,39 @@ fn populate(mut commands: Commands, art: Res<Art>, arts: Res<Assets<PixelleArt>>
     }
 
     // Things that play.
-    for (i, (name, y)) in [(art::fx::EXPLOSION, 0.0), (art::weapons::ROCKET, 0.0), (art::weapons::SHELL, 0.0)].into_iter().enumerate() {
-        commands.spawn((sprite(name), PixelleAnimation::looping(), at(-90.0 + i as f32 * 40.0, -30.0 + y, 1.0)));
+    for (name, x, y) in [(art::fx::EXPLOSION, 104.0, -22.0), (art::weapons::ROCKET, -30.0, -18.0), (art::weapons::SHELL, -10.0, -18.0)] {
+        commands.spawn((sprite(name), PixelleAnimation::looping(), at(x, y, 1.0)));
     }
     for (i, e) in [art::emotes::CRY, art::emotes::ANGRY, art::emotes::LAUGH, art::emotes::COOL].into_iter().enumerate() {
-        commands.spawn((sprite(e), at(20.0 + i as f32 * 12.0, -30.0, 0.0)));
+        commands.spawn((sprite(e), at(20.0 + i as f32 * 12.0, -18.0, 0.0)));
     }
 
-    // A block of earth from the wall sheet, the way the game's cladding lays one out: the
-    // transposed frames are real frames of the baked sheet, and flips make up the rest.
-    use art::walls::sheet as w;
-    let (cols, rows) = (6, 3);
-    for r in 0..rows {
-        for c in 0..cols {
-            let (edge_x, edge_y) = (c == 0 || c == cols - 1, r == 0 || r == rows - 1);
-            let frame = match (edge_x, edge_y) {
-                (true, true) => w::CORNER,
-                (false, true) => w::TOP,
-                (true, false) => w::LEFT,
-                (false, false) => w::INTERIOR,
-            };
-            commands.spawn((
-                PixelleSprite {
-                    flip_x: c == cols - 1,
-                    flip_y: r == rows - 1,
-                    ..sprite(art::walls::SHEET).frame(frame)
-                },
-                at(-100.0 + c as f32 * 8.0, -52.0 - r as f32 * 8.0, -0.9),
-            ));
+    // A grid map, clad at run time by the file's walls terrain — whole frames where they fit,
+    // quarters elsewhere — the way a grid-painted run-2d level is. Row 0 is the bottom.
+    const MAP: [&str; 5] = [
+        "##.....#.",
+        "#......#.",
+        "#..##..##",
+        "#..##...#",
+        "#########",
+    ];
+    let walls = a.terrain(art::terrains::WALLS).expect("the walls terrain");
+    let size = walls.cell_size() as f32;
+    let ground = |c: IVec2| {
+        let row = MAP.len() as i32 - 1 - c.y;
+        (0..MAP.len() as i32).contains(&row)
+            && MAP[row as usize].as_bytes().get(c.x as usize).is_some_and(|b| *b == b'#')
+    };
+    for row in 0..MAP.len() as i32 {
+        for col in 0..MAP[0].len() as i32 {
+            let cell = IVec2::new(col, row);
+            if !ground(cell) {
+                continue;
+            }
+            let centre = Vec2::new(-116.0 + col as f32 * size, -68.0 + row as f32 * size);
+            for piece in walls.cell(|d| ground(cell + d)) {
+                commands.spawn((walls.sprite(&piece), Transform::from_translation((centre + piece.offset).extend(-0.9))));
+            }
         }
     }
     // A girder, and what stands on the ground.

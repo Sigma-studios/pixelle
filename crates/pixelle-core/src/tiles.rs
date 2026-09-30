@@ -148,7 +148,7 @@ impl Rule {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Terrain {
     pub name: String,
     /// The tileset's name.
@@ -157,15 +157,148 @@ pub struct Terrain {
     pub rules: Vec<Rule>,
     /// Drawn where no rule matches.
     pub fallback: Option<u32>,
+    /// Where no rule matches, draw the cell in four quarters instead, each chosen by these from
+    /// its own corner of the neighbourhood. Empty: no quarters. Tried before `fallback`.
+    pub quarters: Vec<QuarterRule>,
+}
+
+/// How to draw one quarter of a cell, written for the top-left quarter; the other three are its
+/// mirror images.
+///
+/// A quarter looks at three neighbours: the one above it (`vertical`), the one beside it
+/// (`horizontal`) and the one off its corner (`diagonal`). When they match, it shows the top-left
+/// quarter of `tile` in orientation `transform`, mirrored into place.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct QuarterRule {
+    pub name: String,
+    pub vertical: Cond,
+    pub horizontal: Cond,
+    pub diagonal: Cond,
+    pub tile: u32,
+    pub transform: D4,
+}
+
+/// What a cell shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Choice {
+    Whole { tile: u32, transform: D4 },
+    /// Top-left, top-right, bottom-left, bottom-right.
+    Quarters([Quarter; 4]),
+}
+
+/// One quarter of a cell: the top-left quarter of `tile` in orientation `transform`, then
+/// flipped by `place` into its corner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Quarter {
+    pub tile: u32,
+    pub transform: D4,
+    pub place: D4,
+}
+
+/// The flips that carry the top-left quarter into each corner, in [`Choice::Quarters`] order.
+pub const QUARTER_PLACES: [D4; 4] = [
+    D4::new(false, false, false),
+    D4::new(false, true, false),
+    D4::new(false, false, true),
+    D4::new(false, true, true),
+];
+
+impl QuarterRule {
+    fn matches(&self, place: D4, same: &impl Fn(IVec2) -> bool) -> bool {
+        let test = |cond: Cond, d: IVec2| match cond {
+            Cond::Any => true,
+            Cond::Same => same(place.apply_offset(d)),
+            Cond::NotSame => !same(place.apply_offset(d)),
+        };
+        test(self.vertical, IVec2::new(0, -1))
+            && test(self.horizontal, IVec2::new(-1, 0))
+            && test(self.diagonal, IVec2::new(-1, -1))
+    }
 }
 
 impl Terrain {
-    /// The tile a cell shows, given which of its neighbours (by offset) are the same terrain.
+    pub fn new(name: impl Into<String>, tileset: impl Into<String>, rules: Vec<Rule>) -> Self {
+        Self {
+            name: name.into(),
+            tileset: tileset.into(),
+            rules,
+            fallback: None,
+            quarters: Vec::new(),
+        }
+    }
+
+    /// The whole tile a cell shows, given which of its neighbours (by offset) are the same
+    /// terrain — ignoring quarters.
     pub fn resolve(&self, same: impl Fn(IVec2) -> bool) -> Option<(u32, D4)> {
         self.rules
             .iter()
             .find_map(|rule| rule.resolve(&same))
             .or(self.fallback.map(|tile| (tile, D4::IDENTITY)))
+    }
+
+    /// What a cell shows: a whole tile by the rules, else quarters, else the fallback.
+    pub fn choose(&self, same: impl Fn(IVec2) -> bool) -> Option<Choice> {
+        if let Some((tile, transform)) = self.rules.iter().find_map(|rule| rule.resolve(&same)) {
+            return Some(Choice::Whole { tile, transform });
+        }
+        if !self.quarters.is_empty() {
+            let mut out = [Quarter { tile: 0, transform: D4::IDENTITY, place: D4::IDENTITY }; 4];
+            let mut all = true;
+            for (q, place) in out.iter_mut().zip(QUARTER_PLACES) {
+                match self.quarters.iter().find(|r| r.matches(place, &same)) {
+                    Some(r) => *q = Quarter { tile: r.tile, transform: r.transform, place },
+                    None => all = false,
+                }
+            }
+            if all {
+                return Some(Choice::Quarters(out));
+            }
+        }
+        self.fallback.map(|tile| Choice::Whole { tile, transform: D4::IDENTITY })
+    }
+
+    /// Every orientation a tile may be drawn in, by any rule: what an engine that cannot
+    /// transpose needs baked.
+    pub fn needs_transpose(&self) -> bool {
+        self.rules.iter().any(|r| r.symmetric || r.transform.transpose)
+            || self.quarters.iter().any(|q| q.transform.transpose)
+    }
+}
+
+/// Terrains were written without `quarters` before format version 2; the reader says which
+/// layout it is reading through this.
+pub(crate) mod compat {
+    use std::cell::Cell;
+
+    thread_local! {
+        pub static FORMAT: Cell<u16> = const { Cell::new(crate::format::VERSION) };
+    }
+}
+
+impl<'de> Deserialize<'de> for Terrain {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct V1 {
+            name: String,
+            tileset: String,
+            rules: Vec<Rule>,
+            fallback: Option<u32>,
+        }
+        #[derive(Deserialize)]
+        struct V2 {
+            name: String,
+            tileset: String,
+            rules: Vec<Rule>,
+            fallback: Option<u32>,
+            quarters: Vec<QuarterRule>,
+        }
+        if compat::FORMAT.with(|f| f.get()) < 2 {
+            let t = V1::deserialize(d)?;
+            Ok(Terrain { name: t.name, tileset: t.tileset, rules: t.rules, fallback: t.fallback, quarters: Vec::new() })
+        } else {
+            let t = V2::deserialize(d)?;
+            Ok(Terrain { name: t.name, tileset: t.tileset, rules: t.rules, fallback: t.fallback, quarters: t.quarters })
+        }
     }
 }
 
@@ -197,23 +330,44 @@ pub mod presets {
 
     /// Autotiling from seven canonical tiles and the eight orientations of a square.
     ///
-    /// The set is complete for any shape made of whole cells; a lone cell, which no tile draws,
-    /// shows the strip end.
+    /// A whole tile is used only where it is exactly right — an edge whose diagonals agree with
+    /// it, a lone inside corner, a pair of inside corners above or below. Everything else is left
+    /// to [`quarters_d4`], which draws any neighbourhood from the same seven tiles. This is how
+    /// run-2d clads its grid maps (`cladding.rs`, `whole_frame` and `quarter`).
     pub fn minimal_d4(t: MinimalD4) -> Vec<Rule> {
         let rule = |name: &str, picture: &str, tile: u32| {
-            Rule::parse(name, picture, tile)
-                .expect("preset patterns are well-formed")
-                .symmetric()
+            Rule::parse(name, picture, tile).expect("preset patterns are well-formed")
         };
         vec![
-            rule("single", "?.? .x. ?.?", t.strip_end),
-            rule("strip end", "?.? .x. ?#?", t.strip_end),
-            rule("strip", "?#? .x. ?#?", t.strip),
-            rule("corner", "?.? .x# ?#?", t.corner),
-            rule("edge", "?.? #x# ?#?", t.edge),
-            rule("double inside", ".#. #x# ?#?", t.double_inside),
-            rule("inside", "##. #x# ?#?", t.inside),
-            rule("interior", "?#? #x# ?#?", t.interior),
+            rule("interior", "### #x# ###", t.interior),
+            rule("inside", "##. #x# ###", t.inside).symmetric(),
+            rule("double inside", ".#. #x# ###", t.double_inside),
+            rule("double inside below", "### #x# .#.", t.double_inside).with_transform(D4::FLIP_Y),
+            rule("edge", "?.? #x# ###", t.edge).symmetric(),
+            rule("corner", "?.? .x# ?##", t.corner).symmetric(),
+            rule("strip", "?#? .x. ?#?", t.strip).symmetric(),
+            rule("strip end", "?.? .x. ?#?", t.strip_end).symmetric(),
+        ]
+    }
+
+    /// Quarters for [`minimal_d4`]: any neighbourhood, a corner at a time.
+    pub fn quarters_d4(t: MinimalD4) -> Vec<QuarterRule> {
+        let q = |name: &str, vertical, horizontal, diagonal, tile, transform| QuarterRule {
+            name: name.into(),
+            vertical,
+            horizontal,
+            diagonal,
+            tile,
+            transform,
+        };
+        use Cond::*;
+        vec![
+            q("corner", NotSame, NotSame, Any, t.corner, D4::IDENTITY),
+            q("top", NotSame, Same, Any, t.edge, D4::IDENTITY),
+            q("side", Same, NotSame, Any, t.edge, D4::TRANSPOSE),
+            // The inside tile is lit at its top right; its right-hand quarter, mirrored.
+            q("inside", Same, Same, NotSame, t.inside, D4::FLIP_X),
+            q("interior", Same, Same, Same, t.interior, D4::IDENTITY),
         ]
     }
 
@@ -346,6 +500,7 @@ mod tests {
                 double_inside: DOUBLE,
             }),
             fallback: Some(INTERIOR),
+            quarters: Vec::new(),
         }
     }
 
@@ -459,6 +614,7 @@ mod tests {
             tileset: "t".into(),
             rules: edge16(),
             fallback: None,
+            quarters: Vec::new(),
         };
         // Same terrain above and to the left: 1 + 8.
         let got = t.resolve(|d| d == IVec2::new(0, -1) || d == IVec2::new(-1, 0));
@@ -473,6 +629,7 @@ mod tests {
             tileset: "p".into(),
             rules,
             fallback: None,
+            quarters: Vec::new(),
         };
         let solid = [0, 1, 2];
         let at = |x: i32| t.resolve(|d| d.y == 0 && solid.contains(&(x + d.x))).unwrap().0;
