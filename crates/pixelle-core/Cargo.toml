@@ -1,0 +1,17 @@
+[package]
+name = "pixelle-core"
+description = "Data model, compositing, packing and file format for Pixelle projects"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+postcard.workspace = true
+miniz_oxide.workspace = true
+glam.workspace = true
+png = { workspace = true, optional = true }
+
+[features]
+default = ["png"]
+png = ["dep:png"]

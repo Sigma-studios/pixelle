@@ -1,0 +1,19 @@
+[workspace]
+resolver = "3"
+members = ["crates/pixelle-core", "crates/pixelle-cli", "tools/run2d-import"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+pixelle-core = { path = "crates/pixelle-core" }
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+miniz_oxide = "0.8"
+glam = { version = "0.30", features = ["serde"] }
+png = "0.18"
+clap = { version = "4", features = ["derive"] }
+ron = "0.10"
+anyhow = "1"

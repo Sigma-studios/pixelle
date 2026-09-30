@@ -1,0 +1,17 @@
+[package]
+name = "pixelle-cli"
+description = "Inspect, render and pack Pixelle projects from the command line"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "pixelle"
+path = "src/main.rs"
+
+[dependencies]
+pixelle-core.workspace = true
+clap.workspace = true
+ron.workspace = true
+serde.workspace = true
+anyhow.workspace = true

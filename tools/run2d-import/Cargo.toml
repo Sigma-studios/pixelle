@@ -1,0 +1,12 @@
+[package]
+name = "run2d-import"
+description = "Generate run2d.pxl from run-2d's sheets and the art its code draws"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+pixelle-core.workspace = true
+anyhow.workspace = true
+miniz_oxide.workspace = true
