@@ -143,7 +143,7 @@ const LEVEL: [&str; 16] = [
     "........................................",
     "....====..........................====..",
     "........................................",
-    "...........................#............",
+    "......=....................#............",
     "..........#####............#............",
     "...........................#.....###....",
     "...............====..............###....",
@@ -536,6 +536,17 @@ impl Import {
             }
         }
 
+        // A platform one tile long (`cladding.rs` `run`): the sheet has no frame for it, so the
+        // game draws the outer half of each cap side by side. Here it is a frame of its own.
+        let h = TILE / 2;
+        for y in 0..TILE {
+            for x in 0..TILE {
+                let from = if x < h { strip(PLATFORMS_Y, 0).min() + IVec2::new(x, y) } else { strip(PLATFORMS_Y, 2).min() + IVec2::new(x, y) };
+                let v = self.grid(self.l.art).get(from);
+                self.grid(self.l.art).set(strip(PLATFORMS_Y, 3).min() + IVec2::new(x, y), v);
+            }
+        }
+
         // The level editor's cursors (`editor.rs:1413-1562`), which it draws as flat quads.
         let hover = self.named("Editor", "hover");
         let selection = self.named("Editor", "selection");
@@ -662,10 +673,10 @@ impl Import {
             Sprite::new(
                 "platforms/sheet",
                 art.clone(),
-                (0..3).map(|i| Frame::new(strip(PLATFORMS_Y, i)).with_rect("ink", ink)).collect(),
+                (0..4).map(|i| Frame::new(strip(PLATFORMS_Y, i)).with_rect("ink", ink)).collect(),
             ),
             "frames",
-            "cap_left,middle,cap_right",
+            "cap_left,middle,cap_right,single",
         ));
 
         // The blast, one frame per tick, pivoting on its centre.
@@ -710,8 +721,8 @@ impl Import {
             name: "platforms".into(),
             origin: IVec2::new(LEFT, PLATFORMS_Y),
             tile_size: TILE as u32,
-            columns: 3,
-            count: 3,
+            columns: 4,
+            count: 4,
             layers: art,
         });
         // `cladding.rs` `clad_terrain`: whole frames where one is exactly right, quarters
@@ -735,7 +746,7 @@ impl Import {
         self.p.terrains.push(Terrain {
             name: "platforms".into(),
             tileset: "platforms".into(),
-            rules: presets::horizontal_run(0, 1, 2, 1),
+            rules: presets::horizontal_run(0, 1, 2, 3),
             fallback: None,
             quarters: Vec::new(),
         });
@@ -1017,6 +1028,29 @@ impl Import {
             let theirs = run2d_cell(&derived, open);
             ensure!(normalise(&ours) == normalise(&theirs), "walls terrain differs from cladding.rs for neighbourhood {mask:08b}");
         }
+
+        // A lone platform cell draws what `run` draws for a one-tile platform: the left cap's
+        // outer half, then the right cap's.
+        let (_, _, girders) = self.sheets.iter().find(|(n, ..)| n == "platforms").context("platforms")?;
+        let mut lone = RgbaImage::new(TILE as u32, TILE as u32);
+        for y in 0..TILE as u32 {
+            for x in 0..TILE as u32 {
+                let sx = if x < TILE as u32 / 2 { x } else { 2 * TILE as u32 + x };
+                let s = ((y * girders.w + sx) * 4) as usize;
+                let d = ((y * TILE as u32 + x) * 4) as usize;
+                lone.px[d..d + 4].copy_from_slice(&girders.px[s..s + 4]);
+            }
+        }
+        let platforms_id = self.p.terrain_id("platforms").context("platforms terrain")?;
+        if let LayerKind::Terrain(t) = &mut scratch.layer_mut(probe).unwrap().kind {
+            t.cells = Grid::new();
+            t.cells.set(origin, platforms_id);
+        }
+        let at = origin * TILE;
+        let drawn = Renderer::new(&scratch)
+            .indexed(IRect::new(at.x, at.y, TILE as u32, TILE as u32), &[probe])
+            .to_rgba(&scratch.palette);
+        ensure!(normalise(&drawn) == normalise(&lone), "a one-cell platform differs from cladding.rs run()");
 
         // Every frame of every sheet is reachable by some sprite name.
         let mut covered: BTreeMap<(i32, i32), ()> = BTreeMap::new();
