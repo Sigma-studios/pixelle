@@ -4826,7 +4826,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "eframe",
+ "objc2 0.6.4",
+ "objc2-core-graphics",
+ "objc2-quartz-core 0.3.2",
  "pixelle-core",
+ "raw-window-handle",
  "rfd",
 ]
 

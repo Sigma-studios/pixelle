@@ -11,6 +11,7 @@
 mod app;
 mod backend;
 mod canvas;
+mod colour;
 mod doc;
 mod panels;
 mod tools;

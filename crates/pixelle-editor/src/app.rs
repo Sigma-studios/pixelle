@@ -1041,7 +1041,8 @@ pub fn new_project(preset: presets::Preset) -> Project {
 }
 
 impl eframe::App for Editor {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        crate::colour::tag_srgb(frame);
         self.show(ui);
     }
 }
