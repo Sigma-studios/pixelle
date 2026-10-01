@@ -90,6 +90,16 @@ fn hand_pixel(pose: usize) -> IVec2 {
     }
 }
 
+/// `ragdoll.rs` `cut_of`: `[left, top, right, bottom]` of each piece in the standing frame.
+const RAGDOLL_CUTS: [(&str, [i32; 4]); 6] = [
+    ("head", [3, 0, 6, 2]),
+    ("torso", [3, 2, 5, 5]),
+    ("front_arm", [5, 2, 6, 5]),
+    ("back_arm", [2, 2, 3, 5]),
+    ("front_leg", [4, 5, 5, 8]),
+    ("back_leg", [3, 5, 4, 8]),
+];
+
 /// `weapon.rs:507-509`.
 const TRIGGER: IVec2 = IVec2::new(4, 4);
 const MUZZLE: IVec2 = IVec2::new(6, 3);
@@ -206,6 +216,7 @@ fn main() -> Result<()> {
     import.level()?;
     import.p.palette.drop_empty_sections();
     import.verify()?;
+    import.colours_in_code()?;
 
     let problems = import.p.validate();
     ensure!(problems.is_empty(), "the generated project has problems:\n{}", problems.join("\n"));
@@ -547,9 +558,11 @@ impl Import {
             }
         }
 
-        // The level editor's cursors (`editor.rs:1413-1562`), which it draws as flat quads.
-        let hover = self.named("Editor", "hover");
-        let selection = self.named("Editor", "selection");
+        // The level editor's marks (`editor.rs`), which it draws as flat quads: the hover is a
+        // plain white cell the game tints with the tool's colour, the selection a frame in the
+        // picked blue.
+        let hover = self.named("DawnBringer 32", "white");
+        let selection = self.named("Editor", "picked edge");
         let problem = self.named("Editor", "problem");
         let art = self.l.art;
         let g = self.grid(art);
@@ -572,7 +585,18 @@ impl Import {
 
         // The player: every pose by name, each with the pixel it holds a weapon by, plus the
         // cycles, the whole sheet by pose index, and the net over it.
-        let pose = |i: usize| Frame::new(strip(PLAYER_Y, i as i32)).with_point("hand", hand_pixel(i));
+        let pose = |i: usize| {
+            let mut f = Frame::new(strip(PLAYER_Y, i as i32)).with_point("hand", hand_pixel(i));
+            if i == IDLE as usize {
+                // `ragdoll.rs` `cut_of`: the pieces a body breaks into, cut from the standing
+                // frame; and `killfeed.rs` `FACE_CUT`, the face a death row shows.
+                for (name, [l, t, r, b]) in RAGDOLL_CUTS {
+                    f = f.with_rect(name, IRect::new(l, t, (r - l) as u32, (b - t) as u32));
+                }
+                f = f.with_rect("face", IRect::new(2, 0, 4, 4));
+            }
+            f
+        };
         let poses: Vec<Frame> = (0..POSES.len()).map(pose).collect();
         self.add(tagged(
             Sprite::new("player/poses", art.clone(), poses),
@@ -1079,6 +1103,88 @@ impl Import {
     }
 }
 
+impl Import {
+    /// Every colour the game's code names should be in the palette, so the art and the code
+    /// cannot drift apart unseen. Debug overlays are left out. Anything missing is reported.
+    fn colours_in_code(&mut self) -> Result<()> {
+        // Debug drawing only (`weapon.rs` melee gizmos), never part of the game's look.
+        const DEBUG: [&str; 4] = ["SWUNG", "TARGET_BOX", "NETTED_BOX", "PIECE_BOX"];
+        let mut files = Vec::new();
+        let mut dirs = vec![self.root.join("src")];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir)? {
+                let path = entry?.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+        files.sort();
+        for file in files {
+            let name = file.strip_prefix(&self.root).unwrap_or(&file).display().to_string();
+            if name.ends_with("_tests.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&file)?;
+            let text = text.split("#[cfg(test)]").next().unwrap_or("");
+            for (n, line) in text.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                if DEBUG.iter().any(|d| code.contains(d)) {
+                    continue;
+                }
+                for c in literal_colours(code) {
+                    if self.p.palette.find(c, None).is_none() {
+                        self.notes.push(format!(
+                            "{name}:{}: #{:02x}{:02x}{:02x}{:02x} is not in the palette: {}",
+                            n + 1,
+                            c[0],
+                            c[1],
+                            c[2],
+                            c[3],
+                            line.trim()
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `Color::srgb(..)`, `Color::srgba(..)` and `Color::srgb_u8(..)` literals on a line, converted
+/// as the game converts them.
+fn literal_colours(line: &str) -> Vec<[u8; 4]> {
+    let mut out = Vec::new();
+    for (prefix, bytes) in [("Color::srgb_u8(", true), ("Color::srgba(", false), ("Color::srgb(", false)] {
+        let mut rest = line;
+        while let Some(at) = rest.find(prefix) {
+            rest = &rest[at + prefix.len()..];
+            let Some(end) = rest.find(')') else { break };
+            let args: Vec<&str> = rest[..end].split(',').map(str::trim).filter(|a| !a.is_empty()).collect();
+            let parsed: Option<Vec<f32>> = args
+                .iter()
+                .map(|a| {
+                    if bytes {
+                        u8::from_str_radix(a.trim_start_matches("0x"), if a.starts_with("0x") { 16 } else { 10 }).ok().map(|v| v as f32 / 255.0)
+                    } else {
+                        a.parse::<f32>().ok()
+                    }
+                })
+                .collect();
+            match parsed.as_deref() {
+                Some([r, g, b]) => out.push(srgba(*r, *g, *b, 1.0)),
+                Some([r, g, b, a]) => out.push(srgba(*r, *g, *b, *a)),
+                _ => {}
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// `weapon.rs:2558`.
 fn blast_radius(age: u32) -> f32 {
     if age >= EXPLOSION_TICKS {
@@ -1216,4 +1322,20 @@ fn flip(img: &RgbaImage, fx: bool, fy: bool) -> RgbaImage {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn colour_literals_are_found_and_converted_like_the_game() {
+        let line = "a: Color::srgb(0.30, 0.33, 0.40), b: Color::srgba(1.0, 1.0, 1.0, 0.85) Color::srgb_u8(0x4b, 0x94, 0xba)";
+        let got = literal_colours(line);
+        assert!(got.contains(&[77, 84, 102, 255]), "0.30 rounds up, as f32 * 255 does in the game");
+        assert!(got.contains(&[255, 255, 255, 217]));
+        assert!(got.contains(&[0x4b, 0x94, 0xba, 255]));
+        assert_eq!(got.len(), 3);
+        assert!(literal_colours("Color::srgb(SKY)").is_empty());
+    }
 }

@@ -119,16 +119,16 @@ pub const UI: [(&str, [f32; 4]); 14] = [
     ("modal dim", [0.0, 0.0, 0.0, 0.55]),
 ];
 
-/// `editor.rs`: the level editor's overlays and tool colours.
+/// `editor.rs`: the level editor's overlays and tool colours (as of e59b281).
 pub const EDITOR: [(&str, [f32; 4]); 8] = [
-    ("hover", [1.0, 1.0, 1.0, 0.45]),
-    ("selection", [1.0, 0.85, 0.3, 1.0]),
-    ("problem", [0.95, 0.15, 0.15, 0.40]),
     ("grid line", [1.0, 1.0, 1.0, 0.07]),
-    ("wall column", [0.0, 0.0, 0.0, 0.18]),
+    ("problem", [0.95, 0.15, 0.15, 0.40]),
+    ("neutral spawn", [1.0, 1.0, 1.0, 0.85]),
+    ("trouble", [0.90, 0.35, 0.35, 1.0]),
+    ("picked", [0.24, 0.40, 0.66, 1.0]),
+    ("picked edge", [0.62, 0.80, 1.0, 1.0]),
     ("pad tool", [0.55, 0.85, 0.45, 1.0]),
     ("erase tool", [0.95, 0.35, 0.35, 1.0]),
-    ("lit button", [0.40, 0.33, 0.20, 1.0]),
 ];
 
 /// `arena.rs:199-201`: how the map picker draws each material.
