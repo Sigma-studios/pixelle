@@ -1,14 +1,15 @@
 //! The panels around the canvas.
 
 use eframe::egui::{self, Color32, RichText, Sense, Stroke, StrokeKind, vec2};
-use pixelle_core::layer::{Instance, LayerKind, TerrainLayer};
+use pixelle_core::folder::{self, SpriteFrame};
+use pixelle_core::layer::{LayerKind, TerrainLayer};
 use pixelle_core::palette::presets;
-use pixelle_core::tiles::{Cond, QuarterRule, Rule, Terrain, Tileset, presets as tp};
-use pixelle_core::{Bookmark, D4, Frame, Grid, IRect, IVec2, Project, SwapSlot};
+use pixelle_core::{D4, Grid, IVec2, Project, SwapSlot};
 
-use crate::app::{Editor, Selected};
-use crate::canvas::{sprite_mut, unique_name};
+use crate::app::{Editor, Modal, Selected};
+use crate::canvas::sprite_mut;
 use crate::tools::Tool;
+use crate::workspace::{self, TabKind};
 
 fn color32(c: [u8; 4]) -> Color32 {
     Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3])
@@ -113,16 +114,6 @@ impl Editor {
                 }
                 if let Some(sel) = self.selection {
                     ui.label(format!("{}×{} at {}, {}", sel.w, sel.h, sel.x, sel.y));
-                    if ui.button("Make sprite from selection").clicked() {
-                        self.sprite_from_selection(sel);
-                    }
-                    if ui.button("Make tileset from selection").clicked() {
-                        self.tileset_from_selection(sel);
-                    }
-                    if ui.button("Bookmark selection").clicked() {
-                        let name = format!("Area {}", self.doc.project.bookmarks.len() + 1);
-                        self.edit("Add bookmark", None, |p| p.bookmarks.push(Bookmark { name, rect: sel }));
-                    }
                 }
             }
             Tool::Terrain => {
@@ -132,7 +123,7 @@ impl Editor {
                     ui.radio_value(&mut self.active_terrain, i as u8 + 1, name);
                 }
                 if terrains.is_empty() {
-                    ui.label(RichText::new("No terrains yet: make a tileset from a selection, then a terrain in the side panel").small());
+                    ui.label(RichText::new("No terrains yet: make one with File → New file…").small());
                 }
             }
             Tool::Sprite => {
@@ -140,55 +131,109 @@ impl Editor {
                     ui.colored_label(Color32::YELLOW, format!("Click to place {name:?}"));
                 }
             }
-            Tool::Instance => {
-                ui.label(RichText::new(match &self.last_sprite {
-                    Some(s) => format!("Places {s}"),
-                    None => "Select a sprite to place".into(),
-                }).small());
-            }
             _ => {}
         }
-    }
-
-    fn sprite_from_selection(&mut self, sel: IRect) {
-        self.commit_floating();
-        let Some(layer) = self.pixel_layer() else {
-            self.say("Pick the pixel layer the sprite exports");
-            return;
-        };
-        let name = unique_name(&self.doc.project, "sprite");
-        let n = name.clone();
-        self.edit("New sprite", None, |p| p.sprites.push(pixelle_core::Sprite::new(n, vec![layer], vec![Frame::new(sel)])));
-        self.select_sprite(&name, 0);
-    }
-
-    fn tileset_from_selection(&mut self, sel: IRect) {
-        self.commit_floating();
-        let Some(layer) = self.pixel_layer() else {
-            self.say("Pick the pixel layer the tiles are drawn on");
-            return;
-        };
-        let g = self.doc.project.grid.max(1);
-        let (cols, rows) = (sel.w / g, sel.h / g);
-        if cols == 0 || rows == 0 {
-            self.say(format!("A tileset is at least one {g}px tile"));
-            return;
-        }
-        let name = (1..).map(|i| format!("tileset_{i}")).find(|n| self.doc.project.tileset(n).is_none()).unwrap();
-        let ts = Tileset { name: name.clone(), origin: sel.min(), tile_size: g, columns: cols, count: cols * rows, layers: vec![layer] };
-        self.edit("New tileset", None, |p| p.tilesets.push(ts));
-        self.say(format!("Made {name} with {} tiles", cols * rows));
     }
 
     pub fn side_panel(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             egui::CollapsingHeader::new("Layers").default_open(true).show(ui, |ui| self.layers_panel(ui));
             egui::CollapsingHeader::new("Inspector").default_open(true).show(ui, |ui| self.inspector(ui));
-            egui::CollapsingHeader::new("Sprites").default_open(true).show(ui, |ui| self.sprites_panel(ui));
-            egui::CollapsingHeader::new("Terrains").default_open(false).show(ui, |ui| self.terrains_panel(ui));
             egui::CollapsingHeader::new("Recolour slots").default_open(false).show(ui, |ui| self.swaps_panel(ui));
-            egui::CollapsingHeader::new("Bookmarks").default_open(false).show(ui, |ui| self.bookmarks_panel(ui));
         });
+    }
+
+    // --- Files ---------------------------------------------------------------------------------
+
+    pub fn files_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(dir) = self.disk.as_ref().map(|d| d.dir.clone()) else {
+            ui.label(RichText::new("No project folder open: work here is not saved.").weak());
+            if ui.button("Open or start a project folder…").clicked() {
+                self.pick_project();
+            }
+            return;
+        };
+        ui.horizontal(|ui| {
+            let name = dir.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
+            let root = format!("{name}{}", if self.is_unsaved("project") || !self.pending_delete.is_empty() { " •" } else { "" });
+            ui.label(RichText::new(root).strong()).on_hover_text(dir.display().to_string());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("+ New").on_hover_text("New file (⌘N)").clicked() {
+                    self.ask_new_file();
+                }
+            });
+        });
+        ui.add(egui::TextEdit::singleline(&mut self.file_filter).hint_text("filter").desired_width(f32::INFINITY));
+        let filter = self.file_filter.to_lowercase();
+        let assets: Vec<(String, folder::Kind)> = self
+            .project
+            .assets()
+            .into_iter()
+            .filter(|a| filter.is_empty() || a.to_lowercase().contains(&filter))
+            .filter_map(|a| self.project.kind(&a).map(|k| (a, k)))
+            .collect();
+        if assets.is_empty() {
+            ui.label(RichText::new(if filter.is_empty() { "No files yet: + New makes a sprite or a terrain" } else { "Nothing matches" }).small().weak());
+        }
+        // A folder heading wherever the path changes folder.
+        let open = self.kind().asset().map(str::to_string);
+        let mut last_dir: Vec<String> = Vec::new();
+        let mut action: Option<FileAction> = None;
+        egui::ScrollArea::vertical().id_salt("files").max_height(260.0).show(ui, |ui| {
+            for (name, kind) in &assets {
+                let parts: Vec<&str> = name.split('/').collect();
+                let (leaf, dirs) = parts.split_last().expect("names are not empty");
+                let common = last_dir.iter().zip(dirs.iter()).take_while(|(a, b)| a == b).count();
+                for (depth, d) in dirs.iter().enumerate().skip(common) {
+                    ui.horizontal(|ui| {
+                        ui.add_space(depth as f32 * 12.0);
+                        ui.label(RichText::new(format!("📁 {d}")).weak());
+                    });
+                }
+                last_dir = dirs.iter().map(|d| d.to_string()).collect();
+                ui.horizontal(|ui| {
+                    ui.add_space(dirs.len() as f32 * 12.0);
+                    let icon = match kind {
+                        folder::Kind::Sprite => "🖼",
+                        folder::Kind::Terrain => "▦",
+                    };
+                    let dirty = if self.is_unsaved(name) { " •" } else { "" };
+                    let r = ui.selectable_label(open.as_deref() == Some(name.as_str()), format!("{icon} {leaf}{dirty}"));
+                    if r.clicked() {
+                        action = Some(FileAction::Open(name.clone(), *kind));
+                    }
+                    r.context_menu(|ui| {
+                        if ui.button("Rename…").clicked() {
+                            action = Some(FileAction::Rename(name.clone()));
+                            ui.close();
+                        }
+                        if ui.button("Duplicate").clicked() {
+                            action = Some(FileAction::Duplicate(name.clone()));
+                            ui.close();
+                        }
+                        if ui.button("Delete…").clicked() {
+                            action = Some(FileAction::Delete(name.clone()));
+                            ui.close();
+                        }
+                        if ui.button("Show in Finder").clicked() {
+                            action = Some(FileAction::Reveal(name.clone()));
+                            ui.close();
+                        }
+                    });
+                });
+            }
+        });
+        match action {
+            Some(FileAction::Open(name, kind)) => self.open_tab(match kind {
+                folder::Kind::Sprite => TabKind::Sprite(name),
+                folder::Kind::Terrain => TabKind::Terrain(name),
+            }),
+            Some(FileAction::Rename(name)) => self.modal = Some(Modal::Rename { to: name.clone(), from: name, error: None }),
+            Some(FileAction::Duplicate(name)) => self.duplicate(&name),
+            Some(FileAction::Delete(name)) => self.modal = Some(Modal::Delete(name)),
+            Some(FileAction::Reveal(name)) => self.reveal(&name),
+            None => {}
+        }
     }
 
     // --- Palette -------------------------------------------------------------------------------
@@ -231,9 +276,7 @@ impl Editor {
                         if ui.small_button("+").on_hover_text("Add a colour to this section").clicked() {
                             let c = self.doc.project.palette.rgba(self.primary);
                             let c = if c[3] == 0 { [255, 255, 255, 255] } else { c };
-                            let mut new = 0;
-                            self.edit("Add colour", None, |p| new = p.insert_color(si, "new", c).unwrap_or(0));
-                            if new != 0 {
+                            if let Some(new) = self.insert_color(si, "new", c) {
                                 self.primary = new;
                             }
                         }
@@ -257,7 +300,7 @@ impl Editor {
             let section = self.doc.project.palette.section_of(i).map_or("—".to_string(), |s| s.label.clone());
             ui.horizontal(|ui| {
                 ui.label(format!("#{i} in {section}"));
-                ui.label(RichText::new(format!("{} px", self.doc.project.color_usage(i))).weak());
+                ui.label(RichText::new(format!("{} px in the project", self.project.color_usage(i))).weak());
             });
             let mut name = entry.name.clone();
             if ui.text_edit_singleline(&mut name).changed() {
@@ -283,9 +326,8 @@ impl Editor {
                 }
                 if ui.button("Delete").on_hover_text("Pixels of it become the secondary colour").clicked() {
                     let to = self.secondary;
-                    self.edit("Delete colour", None, |p| p.remove_color(i, to));
+                    self.remove_color(i, to);
                     self.primary = 0;
-                    self.fix_selection();
                 }
                 if ui.button("Make recolour slot").clicked() {
                     let name = entry.name.clone();
@@ -329,15 +371,18 @@ impl Editor {
     // --- Layers --------------------------------------------------------------------------------
 
     fn layers_panel(&mut self, ui: &mut egui::Ui) {
+        let kind = self.kind().clone();
+        let fixed = matches!(kind, TabKind::Terrain(_));
         let layers: Vec<(u32, String, bool, bool, bool, &'static str)> = self
             .doc
             .project
             .layers
             .iter()
             .rev()
+            .filter(|l| l.visible || !matches!(kind, TabKind::Sandbox) || l.name != "tiles")
             .map(|l| (l.id, l.name.clone(), l.visible, l.locked, l.reference, l.kind_name()))
             .collect();
-        for (id, name, visible, locked, reference, kind) in layers {
+        for (id, name, visible, locked, reference, lkind) in layers {
             ui.horizontal(|ui| {
                 let mut v = visible;
                 if ui.toggle_value(&mut v, if visible { "👁" } else { "–" }).on_hover_text("Visible").changed() {
@@ -354,15 +399,22 @@ impl Editor {
                     self.commit_floating();
                     self.active_layer = Some(id);
                     // Put the matching tool in hand.
-                    match kind {
+                    match lkind {
                         "terrain" if !matches!(self.tool, Tool::Terrain | Tool::Hand) => self.tool = Tool::Terrain,
-                        "instances" if !matches!(self.tool, Tool::Instance | Tool::Hand) => self.tool = Tool::Instance,
-                        "pixels" if matches!(self.tool, Tool::Terrain | Tool::Instance) => self.tool = Tool::Pencil,
+                        "pixels" if self.tool == Tool::Terrain => self.tool = Tool::Pencil,
                         _ => {}
                     }
                 }
-                ui.label(RichText::new(if reference { format!("{kind} · ref") } else { kind.to_string() }).small().weak());
+                let note = match (&kind, reference, lkind) {
+                    (TabKind::Sprite(_), true, _) => "not exported".to_string(),
+                    (TabKind::Terrain(_), _, "terrain") => "to try the tiles on".to_string(),
+                    (_, _, k) => k.to_string(),
+                };
+                ui.label(RichText::new(note).small().weak());
             });
+        }
+        if fixed {
+            return;
         }
         ui.horizontal_wrapped(|ui| {
             let mut add = |ui: &mut egui::Ui, label: &str, kind: fn(&Project) -> LayerKind| {
@@ -371,25 +423,42 @@ impl Editor {
                     self.edit("Add layer", None, |p| {
                         let k = kind(p);
                         let n = p.layers.len() + 1;
-                        id = p.add_layer(format!("Layer {n}"), k);
+                        let name = (n..).map(|i| format!("layer {i}")).find(|n| p.layer_named(n).is_none()).expect("unbounded");
+                        id = p.add_layer(name, k);
                     });
                     self.active_layer = Some(id);
                 }
             };
-            add(ui, "+ Pixels", |_| LayerKind::Pixels(Grid::new()));
-            add(ui, "+ Terrain", |p| LayerKind::Terrain(TerrainLayer { cell_size: p.grid, cells: Grid::new() }));
-            add(ui, "+ Instances", |_| LayerKind::Instances(Vec::new()));
+            add(ui, "+ Layer", |_| LayerKind::Pixels(Grid::new()));
+            if kind == TabKind::Sandbox {
+                add(ui, "+ Terrain layer", |p| LayerKind::Terrain(TerrainLayer { cell_size: p.terrains.first().map_or(p.grid, |_| p.tilesets[0].tile_size), cells: Grid::new() }));
+            }
         });
         let Some(id) = self.active_layer else { return };
         let Some(layer) = self.doc.project.layer(id).cloned() else { return };
+        if kind == TabKind::Sandbox && layer.name == "tiles" && !layer.visible {
+            return;
+        }
         ui.horizontal(|ui| {
             let mut name = layer.name.clone();
             if ui.add(egui::TextEdit::singleline(&mut name).desired_width(120.0)).changed() {
-                self.edit("Rename layer", Some(&format!("layer-name-{id}")), |p| p.layer_mut(id).unwrap().name = name);
+                if self.doc.project.layer_named(&name).is_some_and(|l| l.id != id) {
+                    self.say(format!("There is already a layer called {name:?}"));
+                } else {
+                    self.edit("Rename layer", Some(&format!("layer-name-{id}")), |p| p.layer_mut(id).unwrap().name = name);
+                }
             }
-            let mut r = layer.reference;
-            if ui.checkbox(&mut r, "Reference").on_hover_text("Shown, never exported").changed() {
-                self.edit("Toggle reference", None, |p| p.layer_mut(id).unwrap().reference = r);
+            if matches!(kind, TabKind::Sprite(_)) {
+                let mut export = !layer.reference;
+                if ui.checkbox(&mut export, "Exported").on_hover_text("Part of what the game gets; off for sketches and guides").changed() {
+                    self.edit("Toggle export", None, |p| {
+                        p.layer_mut(id).unwrap().reference = !export;
+                        let exported: Vec<u32> = p.layers.iter().filter(|l| !l.reference && l.pixels().is_some()).map(|l| l.id).collect();
+                        for s in &mut p.sprites {
+                            s.layers = exported.clone();
+                        }
+                    });
+                }
             }
         });
         ui.horizontal(|ui| {
@@ -400,211 +469,170 @@ impl Editor {
             if ui.add_enabled(pos > 0, egui::Button::new("Down")).clicked() {
                 self.edit("Move layer", None, |p| p.layers.swap(pos, pos - 1));
             }
-            if ui.button("Delete").clicked() {
+            let pixel_layers = self.doc.project.layers.iter().filter(|l| l.pixels().is_some() && l.visible || l.name != "tiles").count();
+            if ui.add_enabled(pixel_layers > 1, egui::Button::new("Delete")).clicked() {
                 self.edit("Delete layer", None, |p| {
                     p.layers.retain(|l| l.id != id);
                     for s in &mut p.sprites {
                         s.layers.retain(|l| *l != id);
                     }
-                    for t in &mut p.tilesets {
-                        t.layers.retain(|l| *l != id);
-                    }
                 });
                 self.fix_selection();
             }
-            if let LayerKind::Terrain(t) = &layer.kind {
-                let mut size = t.cell_size;
-                ui.label("cell");
-                if ui.add(egui::DragValue::new(&mut size).range(1..=256)).changed() {
-                    self.edit("Cell size", Some("cell-size"), |p| {
-                        if let LayerKind::Terrain(t) = &mut p.layer_mut(id).unwrap().kind {
-                            t.cell_size = size;
-                        }
-                    });
-                }
-            }
         });
-    }
-
-    // --- Sprites -------------------------------------------------------------------------------
-
-    fn sprites_panel(&mut self, ui: &mut egui::Ui) {
-        ui.add(egui::TextEdit::singleline(&mut self.sprite_filter).hint_text("filter"));
-        let filter = self.sprite_filter.to_lowercase();
-        let names: Vec<(String, bool, usize)> = self
-            .doc
-            .project
-            .sprites
-            .iter()
-            .filter(|s| filter.is_empty() || s.name.to_lowercase().contains(&filter))
-            .map(|s| (s.name.clone(), s.is_animation(), s.frames.len()))
-            .collect();
-        let selected = match &self.selected {
-            Selected::Sprite { name, .. } => Some(name.clone()),
-            _ => None,
-        };
-        egui::ScrollArea::vertical().id_salt("sprites").max_height(260.0).show(ui, |ui| {
-            for (name, anim, frames) in names {
-                let label = if anim {
-                    format!("▶ {name}  ({frames})")
-                } else if frames > 1 {
-                    format!("# {name}  ({frames})")
-                } else {
-                    format!("  {name}")
-                };
-                let r = ui.selectable_label(selected.as_deref() == Some(&name), label);
-                if r.clicked() {
-                    self.select_sprite(&name, 0);
-                }
-                if r.double_clicked()
-                    && let Some(s) = self.doc.project.sprite(&name)
-                {
-                    let b = s.bounds();
-                    self.view.fit(self.canvas_rect, b.grow(b.w.max(b.h) as i32));
-                }
-            }
-        });
-        ui.label(RichText::new("Double-click to go to it · drag on the canvas with the Sprite tool to make one").small().weak());
     }
 
     // --- Inspector -----------------------------------------------------------------------------
 
     fn inspector(&mut self, ui: &mut egui::Ui) {
-        match self.selected.clone() {
-            Selected::None => {
-                ui.label(RichText::new("Select a sprite, an instance or a terrain").weak());
+        match self.kind().clone() {
+            TabKind::Sandbox => {
+                ui.label(RichText::new("The Sandbox: paint ground with the Terrain tool (T) to try the project's terrains, doodle on the pixel layer. Nothing here is saved.").weak());
+                if ui.button("Clear it").clicked() {
+                    self.edit("Clear the Sandbox", None, |p| {
+                        for l in &mut p.layers {
+                            match &mut l.kind {
+                                LayerKind::Terrain(t) => t.cells = Grid::new(),
+                                LayerKind::Pixels(g) if l.visible || l.name != "tiles" => *g = Grid::new(),
+                                _ => {}
+                            }
+                        }
+                    });
+                }
             }
-            Selected::Sprite { name, frame } => self.sprite_inspector(ui, &name, frame),
-            Selected::Instance { layer, index } => self.instance_inspector(ui, layer, index),
-            Selected::Terrain(i) => self.terrain_inspector(ui, i),
+            TabKind::Terrain(name) => self.terrain_inspector(ui, &name),
+            TabKind::Sprite(name) => {
+                let frame = match &self.selected {
+                    Selected::Sprite { frame, .. } => *frame,
+                    Selected::None => 0,
+                };
+                self.sprite_inspector(ui, &name, frame);
+            }
+        }
+    }
+
+    fn terrain_inspector(&mut self, ui: &mut egui::Ui, name: &str) {
+        let Some(t) = self.project.terrains.get(name).cloned() else { return };
+        ui.label(RichText::new(t.preset.label()).strong());
+        ui.label(format!("{} tiles of {}×{} px", t.tiles.len(), t.cell, t.cell));
+        let mut mirror = matches!(t.preset, folder::Preset::TwoSurface { mirror: true });
+        ui.add_enabled(false, egui::Checkbox::new(&mut mirror, "Mirror")).on_disabled_hover_text("Fewer tiles, turned to fit, but no shading: coming later");
+        ui.label(RichText::new("Draw each tile in the sheet: a cell of ground shows the tile that matches the air around it, or four quarters cut from the tiles' own corners. Paint the ground below with the Terrain tool (T), right button to erase, to see them together.").small().weak());
+        if ui.button("Reset the ground").clicked()
+            && let Some(fresh) = workspace::canvas_for(&self.project, self.kind())
+        {
+            let cells = fresh.layers.iter().find_map(|l| match &l.kind {
+                LayerKind::Terrain(t) => Some(t.cells.clone()),
+                _ => None,
+            });
+            if let Some(cells) = cells {
+                self.edit("Reset the ground", None, |p| {
+                    for l in &mut p.layers {
+                        if let LayerKind::Terrain(t) = &mut l.kind {
+                            t.cells = cells.clone();
+                        }
+                    }
+                });
+            }
         }
     }
 
     fn sprite_inspector(&mut self, ui: &mut egui::Ui, name: &str, frame: usize) {
         let Some(sprite) = self.doc.project.sprite(name).cloned() else { return };
         let key = |what: &str| format!("{what}-{name}");
-
-        ui.horizontal(|ui| {
-            ui.label("Name");
-            let mut new = sprite.name.clone();
-            let r = ui.text_edit_singleline(&mut new);
-            if r.lost_focus() && new != sprite.name && !new.is_empty() {
-                if self.doc.project.sprite(&new).is_some() {
-                    self.say(format!("{new} already exists"));
-                } else {
-                    let old = sprite.name.clone();
-                    let n = new.clone();
-                    self.edit("Rename sprite", None, |p| {
-                        sprite_mut(p, &old).unwrap().name = n.clone();
-                        for l in &mut p.layers {
-                            if let LayerKind::Instances(list) = &mut l.kind {
-                                for i in list.iter_mut().filter(|i| i.sprite == old) {
-                                    i.sprite = n.clone();
-                                }
-                            }
-                        }
-                    });
-                    self.select_sprite(&new, frame);
-                }
-            }
-        });
-
-        // Which layers it exports.
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Layers");
-            let layers: Vec<(u32, String)> = self
-                .doc
-                .project
-                .layers
-                .iter()
-                .filter(|l| !matches!(l.kind, LayerKind::Instances(_)))
-                .map(|l| (l.id, l.name.clone()))
-                .collect();
-            for (id, lname) in layers {
-                let mut on = sprite.layers.contains(&id);
-                if ui.checkbox(&mut on, lname).changed() {
-                    let n = name.to_string();
-                    self.edit("Sprite layers", None, |p| {
-                        let s = sprite_mut(p, &n).unwrap();
-                        if on {
-                            s.layers.push(id);
-                        } else {
-                            s.layers.retain(|l| *l != id);
-                        }
-                    });
-                }
-            }
-        });
+        let names: Vec<String> = sprite.tags.get("frames").map(|n| n.split(',').map(|s| s.trim().to_string()).collect()).unwrap_or_default();
 
         // Frames.
-        ui.separator();
         ui.horizontal(|ui| {
             ui.label(format!("{} frame(s)", sprite.frames.len()));
-            if ui.button("+ Frame →").on_hover_text("Add a frame right of the last one").clicked() {
-                let n = name.to_string();
-                self.edit("Add frame", None, |p| {
-                    let s = sprite_mut(p, &n).unwrap();
-                    let last = s.frames.last().cloned().unwrap();
-                    let mut f = Frame::new(last.rect.offset(IVec2::new(last.rect.w as i32, 0)));
-                    f.duration = if last.duration > 0.0 { last.duration } else { 0.1 };
-                    if last.duration == 0.0 {
+            if ui.button("+ Frame").on_hover_text("A blank frame after this one").clicked() {
+                self.edit_sprite("Add frame", None, |s| {
+                    let f = &s.frames[frame];
+                    let mut new = SpriteFrame::new(f.w, f.h);
+                    new.duration = if f.duration > 0.0 { f.duration } else { 0.1 };
+                    new.points = f.points.clone();
+                    if f.duration == 0.0 {
                         for fr in &mut s.frames {
                             fr.duration = 0.1;
                         }
                     }
-                    f.points = last.points.clone();
-                    s.frames.push(f);
+                    s.frames.insert(frame + 1, new);
                 });
+                self.selected = Selected::Sprite { name: name.into(), frame: frame + 1 };
             }
-            if sprite.frames.len() > 1 && ui.button("- Frame").clicked() {
-                let n = name.to_string();
-                self.edit("Remove frame", None, |p| {
-                    sprite_mut(p, &n).unwrap().frames.remove(frame);
+            if ui.button("Duplicate").clicked() {
+                self.edit_sprite("Duplicate frame", None, |s| {
+                    let mut f = s.frames[frame].clone();
+                    f.name = None;
+                    s.frames.insert(frame + 1, f);
                 });
-                self.select_sprite(name, frame.saturating_sub(1));
+                self.selected = Selected::Sprite { name: name.into(), frame: frame + 1 };
             }
-            if ui.button("Delete sprite").clicked() {
-                let n = name.to_string();
-                self.edit("Delete sprite", None, |p| p.sprites.retain(|s| s.name != n));
-                self.selected = Selected::None;
+            if sprite.frames.len() > 1 && ui.button("Delete").clicked() {
+                self.edit_sprite("Delete frame", None, |s| {
+                    s.frames.remove(frame);
+                });
+                self.selected = Selected::Sprite { name: name.into(), frame: frame.saturating_sub(1) };
             }
         });
         ui.horizontal_wrapped(|ui| {
             for i in 0..sprite.frames.len() {
-                if ui.selectable_label(i == frame, format!("{i}")).clicked() {
-                    self.select_sprite(name, i);
+                let label = names.get(i).filter(|n| !n.is_empty()).map_or(format!("{i}"), |n| format!("{i} {n}"));
+                if ui.selectable_label(i == frame, label).clicked() {
+                    self.selected = Selected::Sprite { name: name.into(), frame: i };
                 }
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui.add_enabled(frame > 0, egui::Button::new("◀ Move")).clicked() {
+                self.edit_sprite("Move frame", None, |s| s.frames.swap(frame, frame - 1));
+                self.selected = Selected::Sprite { name: name.into(), frame: frame - 1 };
+            }
+            if ui.add_enabled(frame + 1 < sprite.frames.len(), egui::Button::new("Move ▶")).clicked() {
+                self.edit_sprite("Move frame", None, |s| s.frames.swap(frame, frame + 1));
+                self.selected = Selected::Sprite { name: name.into(), frame: frame + 1 };
             }
         });
         let Some(f) = sprite.frames.get(frame).cloned() else { return };
         egui::Grid::new("frame").num_columns(2).show(ui, |ui| {
-            let mut r = f.rect;
-            ui.label("Rect");
+            ui.label("Name");
+            let mut fname = names.get(frame).cloned().unwrap_or_default();
+            if ui.add(egui::TextEdit::singleline(&mut fname).hint_text("for code").desired_width(140.0)).changed() {
+                let count = sprite.frames.len();
+                self.edit("Frame name", Some(&key("fname")), |p| {
+                    let s = sprite_mut(p, name).unwrap();
+                    let mut all: Vec<String> = s.tags.get("frames").map(|n| n.split(',').map(|x| x.trim().to_string()).collect()).unwrap_or_default();
+                    all.resize(count, String::new());
+                    all[frame] = fname.trim().replace(',', " ");
+                    if all.iter().all(|n| n.is_empty()) {
+                        s.tags.remove("frames");
+                    } else {
+                        s.tags.insert("frames".into(), all.join(", "));
+                    }
+                });
+            }
+            ui.end_row();
+            let (mut w, mut h) = (f.rect.w, f.rect.h);
+            ui.label("Size");
             let changed = ui
                 .horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut r.x).prefix("x ")).changed()
-                        | ui.add(egui::DragValue::new(&mut r.y).prefix("y ")).changed()
-                        | ui.add(egui::DragValue::new(&mut r.w).prefix("w ").range(1..=4096)).changed()
-                        | ui.add(egui::DragValue::new(&mut r.h).prefix("h ").range(1..=4096)).changed()
+                    ui.add(egui::DragValue::new(&mut w).prefix("w ").range(1..=1024)).changed() | ui.add(egui::DragValue::new(&mut h).prefix("h ").range(1..=1024)).changed()
                 })
                 .inner;
             if changed {
-                let n = name.to_string();
-                self.edit("Frame rect", Some(&key("rect")), |p| sprite_mut(p, &n).unwrap().frames[frame].rect = r);
+                self.edit_sprite("Frame size", Some(&key("size")), |s| workspace::resize_frame(&mut s.frames[frame], w, h));
             }
             ui.end_row();
             ui.label("Duration");
             let mut ms = (f.duration * 1000.0).round() as u32;
             if ui.add(egui::DragValue::new(&mut ms).suffix(" ms").range(0..=10_000)).on_hover_text("0 for stills").changed() {
-                let n = name.to_string();
-                self.edit("Frame duration", Some(&key("dur")), |p| sprite_mut(p, &n).unwrap().frames[frame].duration = ms as f32 / 1000.0);
+                self.edit("Frame duration", Some(&key("dur")), |p| sprite_mut(p, name).unwrap().frames[frame].duration = ms as f32 / 1000.0);
             }
             ui.end_row();
-            ui.label("Orientation");
+            ui.label("Exported as");
             let mut t = f.transform;
             if transform_combo(ui, ("frame-t", name, frame), &mut t) {
-                let n = name.to_string();
-                self.edit("Frame orientation", None, |p| sprite_mut(p, &n).unwrap().frames[frame].transform = t);
+                self.edit("Frame orientation", None, |p| sprite_mut(p, name).unwrap().frames[frame].transform = t);
             }
             ui.end_row();
         });
@@ -617,9 +645,9 @@ impl Editor {
                 let mut v = *p;
                 let changed = ui.add(egui::DragValue::new(&mut v.x).prefix("x ")).changed() | ui.add(egui::DragValue::new(&mut v.y).prefix("y ")).changed();
                 if changed {
-                    let (n, pn) = (name.to_string(), pname.clone());
+                    let pn = pname.clone();
                     self.edit("Move point", Some(&key(pname)), |pr| {
-                        sprite_mut(pr, &n).unwrap().frames[frame].points.insert(pn, v);
+                        sprite_mut(pr, name).unwrap().frames[frame].points.insert(pn, v);
                     });
                 }
                 if ui.small_button("place").clicked() {
@@ -627,17 +655,17 @@ impl Editor {
                     self.tool = Tool::Sprite;
                 }
                 if ui.small_button("all frames").on_hover_text("Copy to every frame").clicked() {
-                    let (n, pn) = (name.to_string(), pname.clone());
+                    let pn = pname.clone();
                     self.edit("Copy point", None, |pr| {
-                        for fr in &mut sprite_mut(pr, &n).unwrap().frames {
+                        for fr in &mut sprite_mut(pr, name).unwrap().frames {
                             fr.points.insert(pn.clone(), v);
                         }
                     });
                 }
                 if ui.small_button("×").clicked() {
-                    let (n, pn) = (name.to_string(), pname.clone());
+                    let pn = pname.clone();
                     self.edit("Remove point", None, |pr| {
-                        sprite_mut(pr, &n).unwrap().frames[frame].points.remove(&pn);
+                        sprite_mut(pr, name).unwrap().frames[frame].points.remove(&pn);
                     });
                 }
             });
@@ -660,331 +688,31 @@ impl Editor {
         ui.horizontal(|ui| {
             let mut has = sprite.pivot.is_some();
             if ui.checkbox(&mut has, "Pivot").changed() {
-                let n = name.to_string();
                 let c = IVec2::new(f.rect.w as i32 / 2, f.rect.h as i32 / 2);
-                self.edit("Pivot", None, |p| sprite_mut(p, &n).unwrap().pivot = has.then_some(c));
+                self.edit("Pivot", None, |p| sprite_mut(p, name).unwrap().pivot = has.then_some(c));
             }
             if let Some(mut pv) = sprite.pivot {
                 let changed = ui.add(egui::DragValue::new(&mut pv.x).prefix("x ")).changed() | ui.add(egui::DragValue::new(&mut pv.y).prefix("y ")).changed();
                 if changed {
-                    let n = name.to_string();
-                    self.edit("Pivot", Some(&key("pivot")), |p| sprite_mut(p, &n).unwrap().pivot = Some(pv));
+                    self.edit("Pivot", Some(&key("pivot")), |p| sprite_mut(p, name).unwrap().pivot = Some(pv));
                 }
             }
         });
-        for (k, v) in &sprite.tags {
+        for (k, v) in sprite.tags.iter().filter(|(k, _)| *k != "frames") {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(k).monospace());
                 let mut val = v.clone();
                 if ui.text_edit_singleline(&mut val).changed() {
-                    let (n, k2) = (name.to_string(), k.clone());
+                    let k2 = k.clone();
                     self.edit("Edit tag", Some(&key(k)), |p| {
-                        sprite_mut(p, &n).unwrap().tags.insert(k2, val);
+                        sprite_mut(p, name).unwrap().tags.insert(k2, val);
                     });
                 }
             });
         }
     }
 
-    fn instance_inspector(&mut self, ui: &mut egui::Ui, layer: u32, index: usize) {
-        let Some(inst) = self.instance(layer, index).cloned() else { return };
-        let edit = |ed: &mut Editor, label: &str, key: Option<&str>, f: &dyn Fn(&mut Instance)| {
-            ed.edit(label, key, |p| {
-                if let Some(LayerKind::Instances(list)) = p.layer_mut(layer).map(|l| &mut l.kind)
-                    && let Some(i) = list.get_mut(index)
-                {
-                    f(i);
-                }
-            });
-        };
-        ui.horizontal(|ui| {
-            ui.label("Sprite");
-            let names: Vec<String> = self.doc.project.sprites.iter().map(|s| s.name.clone()).collect();
-            let mut s = inst.sprite.clone();
-            egui::ComboBox::from_id_salt("inst-sprite").selected_text(&s).width(170.0).show_ui(ui, |ui| {
-                for n in names {
-                    ui.selectable_value(&mut s, n.clone(), n);
-                }
-            });
-            if s != inst.sprite {
-                edit(self, "Instance sprite", None, &|i| {
-                    i.sprite = s.clone();
-                    i.frame = 0;
-                });
-            }
-        });
-        let frames = self.doc.project.sprite(&inst.sprite).map_or(1, |s| s.frames.len());
-        ui.horizontal(|ui| {
-            let mut fr = inst.frame;
-            ui.label("Frame");
-            if ui.add(egui::DragValue::new(&mut fr).range(0..=frames.saturating_sub(1) as u32)).changed() {
-                edit(self, "Instance frame", Some("inst-frame"), &|i| i.frame = fr);
-            }
-            let mut pos = inst.pos;
-            ui.label("At");
-            let changed = ui.add(egui::DragValue::new(&mut pos.x).prefix("x ")).changed() | ui.add(egui::DragValue::new(&mut pos.y).prefix("y ")).changed();
-            if changed {
-                edit(self, "Move instance", Some("inst-pos"), &|i| i.pos = pos);
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label("Orientation");
-            let mut t = inst.transform;
-            if transform_combo(ui, "inst-t", &mut t) {
-                edit(self, "Instance orientation", None, &|i| i.transform = t);
-            }
-        });
-        // Recolouring.
-        let slots = self.doc.project.swaps.clone();
-        for slot in slots {
-            let current = inst.swaps.iter().find(|(n, _)| *n == slot.name).map(|(_, v)| *v);
-            ui.horizontal(|ui| {
-                ui.label(&slot.name);
-                let Some(sec) = self.doc.project.palette.section(&slot.options).cloned() else { return };
-                ui.spacing_mut().item_spacing = vec2(2.0, 2.0);
-                let default = swatch(ui, self.doc.project.palette.rgba(slot.index), 14.0, current.is_none(), false).on_hover_text("as drawn");
-                if default.clicked() {
-                    let n = slot.name.clone();
-                    edit(self, "Recolour", None, &|i| i.swaps.retain(|(s, _)| *s != n));
-                }
-                for c in sec.indices() {
-                    let r = swatch(ui, self.doc.project.palette.rgba(c), 14.0, current == Some(c), false);
-                    if r.clicked() {
-                        let n = slot.name.clone();
-                        edit(self, "Recolour", None, &|i| {
-                            i.swaps.retain(|(s, _)| *s != n);
-                            i.swaps.push((n.clone(), c));
-                        });
-                    }
-                }
-            });
-        }
-        if ui.button("Delete instance").clicked() {
-            self.edit("Delete instance", None, |p| {
-                if let Some(LayerKind::Instances(list)) = p.layer_mut(layer).map(|l| &mut l.kind) {
-                    list.remove(index);
-                }
-            });
-            self.selected = Selected::None;
-        }
-    }
-
-    // --- Terrains ------------------------------------------------------------------------------
-
-    fn terrains_panel(&mut self, ui: &mut egui::Ui) {
-        let terrains: Vec<(String, String)> = self.doc.project.terrains.iter().map(|t| (t.name.clone(), t.tileset.clone())).collect();
-        for (i, (name, ts)) in terrains.iter().enumerate() {
-            let sel = self.selected == Selected::Terrain(i);
-            if ui.selectable_label(sel, format!("{} {name}  on {ts}", i + 1)).clicked() {
-                self.selected = Selected::Terrain(i);
-                self.active_terrain = i as u8 + 1;
-            }
-        }
-        let tilesets: Vec<(String, u32)> = self.doc.project.tilesets.iter().map(|t| (t.name.clone(), t.count)).collect();
-        if tilesets.is_empty() {
-            ui.label(RichText::new("Select tiles on the canvas (Select tool) and choose “Make tileset from selection”").small().weak());
-            return;
-        }
-        ui.menu_button("New terrain…", |ui| {
-            for (ts, count) in &tilesets {
-                ui.menu_button(format!("on {ts} ({count} tiles)"), |ui| {
-                    // Name, tiles needed, whole-tile rules, quarter rules.
-                    type Preset = (&'static str, u32, fn() -> Vec<Rule>, fn() -> Vec<QuarterRule>);
-                    const ROLES: tp::MinimalD4 = tp::MinimalD4 { corner: 0, edge: 1, strip_end: 2, strip: 3, interior: 4, inside: 5, double_inside: 6 };
-                    let options: [Preset; 4] = [
-                        ("Minimal D4 + quarters (7 tiles)", 7, || tp::minimal_d4(ROLES), || tp::quarters_d4(ROLES)),
-                        ("Edge 16", 16, tp::edge16, Vec::new),
-                        ("Blob 47", 47, tp::blob47, Vec::new),
-                        ("Horizontal run (3 tiles)", 3, || tp::horizontal_run(0, 1, 2, 1), Vec::new),
-                    ];
-                    for (label, need, rules, quarters) in options {
-                        let enabled = *count >= need;
-                        if ui.add_enabled(enabled, egui::Button::new(label)).on_disabled_hover_text(format!("needs {need} tiles")).clicked() {
-                            let name = format!("{ts} terrain");
-                            let mut t = Terrain::new(name, ts.clone(), rules());
-                            t.quarters = quarters();
-                            self.edit("New terrain", None, |p| p.terrains.push(t));
-                            let i = self.doc.project.terrains.len() - 1;
-                            self.selected = Selected::Terrain(i);
-                            self.active_terrain = i as u8 + 1;
-                        }
-                    }
-                });
-            }
-        });
-        ui.label(RichText::new("Presets expect the tileset's tiles in their order: see the rules in the inspector").small().weak());
-    }
-
-    fn terrain_inspector(&mut self, ui: &mut egui::Ui, ti: usize) {
-        let Some(t) = self.doc.project.terrains.get(ti).cloned() else { return };
-        ui.horizontal(|ui| {
-            ui.label("Name");
-            let mut name = t.name.clone();
-            if ui.text_edit_singleline(&mut name).changed() {
-                self.edit("Rename terrain", Some(&format!("terrain-name-{ti}")), |p| p.terrains[ti].name = name);
-            }
-        });
-        let count = self.doc.project.tileset(&t.tileset).map_or(0, |ts| ts.count);
-        ui.horizontal(|ui| {
-            ui.label(format!("Tileset {} · {count} tiles", t.tileset));
-            let mut fb = t.fallback.is_some();
-            if ui.checkbox(&mut fb, "fallback").changed() {
-                self.edit("Terrain fallback", None, |p| p.terrains[ti].fallback = fb.then_some(0));
-            }
-            if let Some(mut f) = t.fallback
-                && ui.add(egui::DragValue::new(&mut f).range(0..=count.saturating_sub(1))).changed()
-            {
-                self.edit("Terrain fallback", Some("fallback"), |p| p.terrains[ti].fallback = Some(f));
-            }
-        });
-        ui.label(RichText::new("Rules, first match wins. Click a neighbour: ? any · # same · . other").small().weak());
-        let ts = self.doc.project.tileset(&t.tileset).cloned();
-        for (ri, rule) in t.rules.iter().enumerate() {
-            ui.horizontal(|ui| {
-                // The 3x3 neighbourhood.
-                egui::Grid::new(("rule", ti, ri)).spacing([1.0, 1.0]).show(ui, |ui| {
-                    let mut slot = 0;
-                    for y in 0..3 {
-                        for x in 0..3 {
-                            if (x, y) == (1, 1) {
-                                ui.label(RichText::new("x").small());
-                            } else {
-                                let s = slot;
-                                let c = rule.pattern[s];
-                                let label = match c {
-                                    Cond::Any => "?",
-                                    Cond::Same => "#",
-                                    Cond::NotSame => ".",
-                                };
-                                if ui.add_sized([16.0, 16.0], egui::Button::new(RichText::new(label).small())).clicked() {
-                                    let next = match c {
-                                        Cond::Any => Cond::Same,
-                                        Cond::Same => Cond::NotSame,
-                                        Cond::NotSame => Cond::Any,
-                                    };
-                                    self.edit("Edit rule", None, |p| p.terrains[ti].rules[ri].pattern[s] = next);
-                                }
-                                slot += 1;
-                            }
-                        }
-                        ui.end_row();
-                    }
-                });
-                ui.vertical(|ui| {
-                    ui.label(RichText::new(&rule.name).small());
-                    ui.horizontal(|ui| {
-                        let mut tile = rule.tile;
-                        if ui.add(egui::DragValue::new(&mut tile).prefix("tile ").range(0..=count.saturating_sub(1))).changed() {
-                            self.edit("Edit rule", Some(&format!("rule-tile-{ti}-{ri}")), |p| p.terrains[ti].rules[ri].tile = tile);
-                        }
-                        if ts.is_some()
-                            && let Some(tex) = self.backend.tile(ui.ctx(), &self.doc.project, &t.tileset, rule.tile, rule.transform)
-                        {
-                            ui.image((tex, vec2(20.0, 20.0)));
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        let mut sym = rule.symmetric;
-                        if ui.checkbox(&mut sym, "all 8 turns").changed() {
-                            self.edit("Edit rule", None, |p| p.terrains[ti].rules[ri].symmetric = sym);
-                        }
-                        let mut tr = rule.transform;
-                        if transform_combo(ui, ("rule-t", ti, ri), &mut tr) {
-                            self.edit("Edit rule", None, |p| p.terrains[ti].rules[ri].transform = tr);
-                        }
-                        if ui.small_button("×").clicked() {
-                            self.edit("Remove rule", None, |p| {
-                                p.terrains[ti].rules.remove(ri);
-                            });
-                        }
-                    });
-                });
-            });
-        }
-        // Quarter rules: the fallback that draws a cell a corner at a time.
-        ui.separator();
-        ui.label(RichText::new("Quarters, where no rule matches. Written for the top-left quarter: the neighbour above, beside, and off the corner.").small().weak());
-        let cycle = |c: Cond| match c {
-            Cond::Any => Cond::Same,
-            Cond::Same => Cond::NotSame,
-            Cond::NotSame => Cond::Any,
-        };
-        let glyph = |c: Cond| match c {
-            Cond::Any => "?",
-            Cond::Same => "#",
-            Cond::NotSame => ".",
-        };
-        for (qi, q) in t.quarters.iter().enumerate() {
-            ui.horizontal(|ui| {
-                for (label, cond, which) in [("above", q.vertical, 0), ("beside", q.horizontal, 1), ("corner", q.diagonal, 2)] {
-                    if ui.add_sized([22.0, 18.0], egui::Button::new(glyph(cond))).on_hover_text(label).clicked() {
-                        let next = cycle(cond);
-                        self.edit("Edit quarter", None, |p| {
-                            let r = &mut p.terrains[ti].quarters[qi];
-                            match which {
-                                0 => r.vertical = next,
-                                1 => r.horizontal = next,
-                                _ => r.diagonal = next,
-                            }
-                        });
-                    }
-                }
-                ui.label(RichText::new(&q.name).small());
-                let mut tile = q.tile;
-                if ui.add(egui::DragValue::new(&mut tile).prefix("tile ").range(0..=count.saturating_sub(1))).changed() {
-                    self.edit("Edit quarter", Some(&format!("quarter-tile-{ti}-{qi}")), |p| p.terrains[ti].quarters[qi].tile = tile);
-                }
-                if let Some(tex) = self.backend.tile(ui.ctx(), &self.doc.project, &t.tileset, q.tile, q.transform) {
-                    // The top-left quarter of the oriented tile is what gets drawn.
-                    ui.add(egui::Image::new((tex, vec2(12.0, 12.0))).uv(egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(0.5, 0.5))));
-                }
-                let mut tr = q.transform;
-                if transform_combo(ui, ("quarter-t", ti, qi), &mut tr) {
-                    self.edit("Edit quarter", None, |p| p.terrains[ti].quarters[qi].transform = tr);
-                }
-                if ui.small_button("×").clicked() {
-                    self.edit("Remove quarter", None, |p| {
-                        p.terrains[ti].quarters.remove(qi);
-                    });
-                }
-            });
-        }
-        if ui.button("+ Quarter").clicked() {
-            self.edit("Add quarter", None, |p| {
-                p.terrains[ti].quarters.push(QuarterRule {
-                    name: "quarter".into(),
-                    vertical: Cond::Any,
-                    horizontal: Cond::Any,
-                    diagonal: Cond::Any,
-                    tile: 0,
-                    transform: D4::IDENTITY,
-                });
-            });
-        }
-        ui.horizontal(|ui| {
-            if ui.button("+ Rule").clicked() {
-                self.edit("Add rule", None, |p| {
-                    let r = Rule::parse("rule", "??? ?x? ???", 0).expect("valid");
-                    p.terrains[ti].rules.push(r);
-                });
-            }
-            if ui.button("Delete terrain").clicked() {
-                self.edit("Delete terrain", None, |p| {
-                    p.terrains.remove(ti);
-                    // Cells hold terrain numbers: shift those above it down, clear its own.
-                    let gone = ti as u8 + 1;
-                    for l in &mut p.layers {
-                        if let LayerKind::Terrain(t) = &mut l.kind {
-                            t.cells.map_values(|v| if v == gone { 0 } else if v > gone { v - 1 } else { v });
-                        }
-                    }
-                });
-                self.selected = Selected::None;
-            }
-        });
-    }
-
-    // --- Swap slots and bookmarks --------------------------------------------------------------
+    // --- Recolour slots --------------------------------------------------------------
 
     fn swaps_panel(&mut self, ui: &mut egui::Ui) {
         let slots = self.doc.project.swaps.clone();
@@ -1014,29 +742,12 @@ impl Editor {
         }
         ui.label(RichText::new("A slot is a palette index the game may recolour from a section. Make one from a colour in the palette panel.").small().weak());
     }
+}
 
-    fn bookmarks_panel(&mut self, ui: &mut egui::Ui) {
-        let marks = self.doc.project.bookmarks.clone();
-        for (i, b) in marks.iter().enumerate() {
-            ui.horizontal(|ui| {
-                if ui.button("Go").clicked() {
-                    self.view.fit(self.canvas_rect, b.rect);
-                }
-                let mut name = b.name.clone();
-                if ui.add(egui::TextEdit::singleline(&mut name).desired_width(120.0)).changed() {
-                    self.edit("Rename bookmark", Some(&format!("bm-{i}")), |p| p.bookmarks[i].name = name);
-                }
-                if ui.small_button("×").clicked() {
-                    self.edit("Remove bookmark", None, |p| {
-                        p.bookmarks.remove(i);
-                    });
-                }
-            });
-        }
-        if ui.button("Bookmark the view").clicked() {
-            let rect = self.view.visible(self.canvas_rect);
-            let name = format!("View {}", marks.len() + 1);
-            self.edit("Add bookmark", None, |p| p.bookmarks.push(Bookmark { name, rect }));
-        }
-    }
+enum FileAction {
+    Open(String, folder::Kind),
+    Rename(String),
+    Duplicate(String),
+    Delete(String),
+    Reveal(String),
 }

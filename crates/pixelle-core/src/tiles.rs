@@ -20,14 +20,18 @@ pub struct Tileset {
     pub count: u32,
     /// The layers the tiles are drawn on.
     pub layers: Vec<LayerId>,
+    /// Pixels between neighbouring tiles.
+    #[serde(default)]
+    pub gap: u32,
 }
 
 impl Tileset {
     pub fn tile_rect(&self, index: u32) -> IRect {
         let (col, row) = (index % self.columns, index / self.columns);
+        let stride = self.tile_size + self.gap;
         IRect::new(
-            self.origin.x + (col * self.tile_size) as i32,
-            self.origin.y + (row * self.tile_size) as i32,
+            self.origin.x + (col * stride) as i32,
+            self.origin.y + (row * stride) as i32,
             self.tile_size,
             self.tile_size,
         )
@@ -35,11 +39,12 @@ impl Tileset {
 
     pub fn bounds(&self) -> IRect {
         let rows = self.count.div_ceil(self.columns);
+        let stride = self.tile_size + self.gap;
         IRect::new(
             self.origin.x,
             self.origin.y,
-            self.columns * self.tile_size,
-            rows * self.tile_size,
+            (self.columns * stride).saturating_sub(self.gap),
+            (rows * stride).saturating_sub(self.gap),
         )
     }
 }
@@ -148,7 +153,7 @@ impl Rule {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Terrain {
     pub name: String,
     /// The tileset's name.
@@ -176,6 +181,9 @@ pub struct QuarterRule {
     pub diagonal: Cond,
     pub tile: u32,
     pub transform: D4,
+    /// Only for the quarter in this corner (one of [`QUARTER_PLACES`]); `None` is every corner.
+    #[serde(default)]
+    pub corner: Option<D4>,
 }
 
 /// What a cell shows.
@@ -245,7 +253,11 @@ impl Terrain {
             let mut out = [Quarter { tile: 0, transform: D4::IDENTITY, place: D4::IDENTITY }; 4];
             let mut all = true;
             for (q, place) in out.iter_mut().zip(QUARTER_PLACES) {
-                match self.quarters.iter().find(|r| r.matches(place, &same)) {
+                match self
+                    .quarters
+                    .iter()
+                    .find(|r| r.corner.is_none_or(|c| c == place) && r.matches(place, &same))
+                {
                     Some(r) => *q = Quarter { tile: r.tile, transform: r.transform, place },
                     None => all = false,
                 }
@@ -262,43 +274,6 @@ impl Terrain {
     pub fn needs_transpose(&self) -> bool {
         self.rules.iter().any(|r| r.symmetric || r.transform.transpose)
             || self.quarters.iter().any(|q| q.transform.transpose)
-    }
-}
-
-/// Terrains were written without `quarters` before format version 2; the reader says which
-/// layout it is reading through this.
-pub(crate) mod compat {
-    use std::cell::Cell;
-
-    thread_local! {
-        pub static FORMAT: Cell<u16> = const { Cell::new(crate::format::VERSION) };
-    }
-}
-
-impl<'de> Deserialize<'de> for Terrain {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        struct V1 {
-            name: String,
-            tileset: String,
-            rules: Vec<Rule>,
-            fallback: Option<u32>,
-        }
-        #[derive(Deserialize)]
-        struct V2 {
-            name: String,
-            tileset: String,
-            rules: Vec<Rule>,
-            fallback: Option<u32>,
-            quarters: Vec<QuarterRule>,
-        }
-        if compat::FORMAT.with(|f| f.get()) < 2 {
-            let t = V1::deserialize(d)?;
-            Ok(Terrain { name: t.name, tileset: t.tileset, rules: t.rules, fallback: t.fallback, quarters: Vec::new() })
-        } else {
-            let t = V2::deserialize(d)?;
-            Ok(Terrain { name: t.name, tileset: t.tileset, rules: t.rules, fallback: t.fallback, quarters: t.quarters })
-        }
     }
 }
 
@@ -359,6 +334,7 @@ pub mod presets {
             diagonal,
             tile,
             transform,
+            corner: None,
         };
         use Cond::*;
         vec![
@@ -470,6 +446,208 @@ pub mod presets {
             rule("middle", "??? #x# ???", middle),
         ]
     }
+
+    /// The roles of [`minimal_d4`] in tile order, with the neighbours each is open to as drawn.
+    const ROLES: [(&str, &[IVec2]); 7] = [
+        ("corner", &[IVec2::new(0, -1), IVec2::new(-1, 0)]),
+        ("edge", &[IVec2::new(0, -1)]),
+        ("end", &[IVec2::new(0, -1), IVec2::new(-1, 0), IVec2::new(1, 0)]),
+        ("strip", &[IVec2::new(-1, 0), IVec2::new(1, 0)]),
+        ("fill", &[]),
+        ("inside", &[IVec2::new(1, -1)]),
+        ("double inside", &[IVec2::new(-1, -1), IVec2::new(1, -1)]),
+    ];
+
+    const ROLE_TILES: MinimalD4 = MinimalD4 {
+        corner: 0,
+        edge: 1,
+        strip_end: 2,
+        strip: 3,
+        interior: 4,
+        inside: 5,
+        double_inside: 6,
+    };
+
+    /// One tile an artist draws for a [`two_surface`] terrain: one of the seven roles of
+    /// [`minimal_d4`], facing one way.
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct Slot {
+        /// What it looks like, for people: "corner top-left", "edge bottom".
+        pub name: String,
+        /// Which of the seven canonical tiles it is a view of.
+        pub role: u32,
+        /// How that tile is turned to make this one.
+        pub orientation: D4,
+    }
+
+    /// A terrain for a grid of two surfaces — ground and air — and the tiles it needs drawn.
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct TwoSurface {
+        pub slots: Vec<Slot>,
+        pub rules: Vec<Rule>,
+        pub quarters: Vec<QuarterRule>,
+    }
+
+    /// The neighbours a role is open to, once turned.
+    fn open_to(role: u32, orientation: D4) -> Vec<IVec2> {
+        let mut dirs: Vec<IVec2> = ROLES[role as usize].1.iter().map(|d| orientation.apply_offset(*d)).collect();
+        dirs.sort_by_key(|d| NEIGHBOURS.iter().position(|n| n == d));
+        dirs
+    }
+
+    fn dir_name(d: IVec2) -> &'static str {
+        match (d.x, d.y) {
+            (-1, -1) => "top-left",
+            (0, -1) => "top",
+            (1, -1) => "top-right",
+            (-1, 0) => "left",
+            (1, 0) => "right",
+            (-1, 1) => "bottom-left",
+            (0, 1) => "bottom",
+            _ => "bottom-right",
+        }
+    }
+
+    fn slot_name(role: u32, dirs: &[IVec2]) -> String {
+        let label = ROLES[role as usize].0;
+        let side = match role {
+            // Open on a side and the side beside it: name the corner between them.
+            0 => {
+                let sum = dirs[0] + dirs[1];
+                dir_name(sum).to_string()
+            }
+            // Open on three sides: named for the one whose opposite is closed.
+            2 => dirs.iter().find(|d| !dirs.contains(&-**d)).map_or("", |d| dir_name(*d)).to_string(),
+            3 => if dirs[0].x != 0 { "vertical".into() } else { "horizontal".into() },
+            4 => return label.into(),
+            // Two diagonals: named for the side they share.
+            6 => {
+                let shared = if dirs[0].x == dirs[1].x { IVec2::new(dirs[0].x, 0) } else { IVec2::new(0, dirs[0].y) };
+                dir_name(shared).to_string()
+            }
+            _ => dirs.iter().map(|d| dir_name(*d)).collect::<Vec<_>>().join(" "),
+        };
+        format!("{label} {side}")
+    }
+
+    /// The "2D grid, two surfaces" terrain: ground cells clad against air, by the rules of
+    /// [`minimal_d4`] and [`quarters_d4`].
+    ///
+    /// Mirrored, it is those rules as they are: seven tiles, turned to fit. Not mirrored, every
+    /// way a tile faces is a tile of its own — the top edge and the bottom edge are drawn
+    /// separately, so one can be lit and the other shaded. Turned tiles that look the same (an edge
+    /// mirrored along itself) are one slot, and a quarter is cut from the matching corner of its
+    /// slot rather than mirrored out of another. Either way a cell picks the same kind of tile in
+    /// the same orientation, which `two_surface_matches_the_mirrored_rules` checks.
+    pub fn two_surface(mirror: bool) -> TwoSurface {
+        let rules = minimal_d4(ROLE_TILES);
+        let quarters = quarters_d4(ROLE_TILES);
+        if mirror {
+            let slots = (0..7)
+                .map(|role| Slot { name: ROLES[role as usize].0.into(), role, orientation: D4::IDENTITY })
+                .collect();
+            return TwoSurface { slots, rules, quarters };
+        }
+
+        // Which orientation of which rule, and which quarter in which corner, ever gets drawn.
+        let mut won = std::collections::BTreeSet::new();
+        let mut used = std::collections::BTreeSet::new();
+        for mask in 0..=255u8 {
+            let same = |d: IVec2| NEIGHBOURS.iter().position(|n| *n == d).is_none_or(|s| mask & (1 << s) != 0);
+            let whole = rules.iter().enumerate().find_map(|(ri, rule)| {
+                orientations(rule).iter().position(|g| pattern_matches(&rule.pattern, *g, &same)).map(|gi| (ri, gi))
+            });
+            if let Some(w) = whole {
+                won.insert(w);
+                continue;
+            }
+            for (pi, place) in QUARTER_PLACES.iter().enumerate() {
+                if let Some(qi) = quarters.iter().position(|q| q.matches(*place, &same)) {
+                    used.insert((qi, pi));
+                }
+            }
+        }
+
+        let mut slots: Vec<Slot> = Vec::new();
+        let mut slot_of = |role: u32, orientation: D4| -> u32 {
+            let dirs = open_to(role, orientation);
+            if let Some(i) = slots.iter().position(|s| s.role == role && open_to(s.role, s.orientation) == dirs) {
+                return i as u32;
+            }
+            slots.push(Slot { name: slot_name(role, &dirs), role, orientation });
+            slots.len() as u32 - 1
+        };
+        let mut out_rules = Vec::new();
+        for (ri, rule) in rules.iter().enumerate() {
+            for (gi, g) in orientations(rule).iter().enumerate() {
+                if !won.contains(&(ri, gi)) {
+                    continue;
+                }
+                let tile = slot_of(rule.tile, g.after(rule.transform));
+                let mut pattern = [Cond::Any; 8];
+                for (i, cond) in rule.pattern.iter().enumerate() {
+                    let to = g.apply_offset(NEIGHBOURS[i]);
+                    pattern[NEIGHBOURS.iter().position(|n| *n == to).expect("a neighbour turns into a neighbour")] = *cond;
+                }
+                out_rules.push(Rule { name: rule.name.clone(), pattern, tile, transform: D4::IDENTITY, symmetric: false });
+            }
+        }
+        let mut out_quarters = Vec::new();
+        for (qi, q) in quarters.iter().enumerate() {
+            for (pi, place) in QUARTER_PLACES.iter().enumerate() {
+                if !used.contains(&(qi, pi)) {
+                    continue;
+                }
+                out_quarters.push(QuarterRule {
+                    name: q.name.clone(),
+                    vertical: q.vertical,
+                    horizontal: q.horizontal,
+                    diagonal: q.diagonal,
+                    tile: slot_of(q.tile, place.after(q.transform)),
+                    // The quarter in this corner of the slot, as drawn: turned by the flip that
+                    // `place` then undoes.
+                    transform: *place,
+                    corner: Some(*place),
+                });
+            }
+        }
+        // Slots in a stable, readable order: by role, then as the rules first met them.
+        let mut order: Vec<usize> = (0..slots.len()).collect();
+        order.sort_by_key(|&i| (slots[i].role, i));
+        let renumber: Vec<u32> = {
+            let mut r = vec![0; slots.len()];
+            for (new, &old) in order.iter().enumerate() {
+                r[old] = new as u32;
+            }
+            r
+        };
+        for r in &mut out_rules {
+            r.tile = renumber[r.tile as usize];
+        }
+        for q in &mut out_quarters {
+            q.tile = renumber[q.tile as usize];
+        }
+        let slots = order.into_iter().map(|i| slots[i].clone()).collect();
+        TwoSurface { slots, rules: out_rules, quarters: out_quarters }
+    }
+
+    /// A [`two_surface`] terrain's tiles, drawn from seven canonical tiles in [`minimal_d4`]
+    /// order — what a mirrored terrain's art becomes when the mirror is turned off.
+    pub fn expand_mirrored(slots: &[Slot], canonical: &[crate::render::Indexed]) -> Vec<crate::render::Indexed> {
+        slots.iter().map(|s| canonical[s.role as usize].transformed(s.orientation)).collect()
+    }
+
+    fn orientations(rule: &Rule) -> &'static [D4] {
+        if rule.symmetric { &D4::ALL } else { &[D4::IDENTITY] }
+    }
+
+    fn pattern_matches(pattern: &[Cond; 8], g: D4, same: &impl Fn(IVec2) -> bool) -> bool {
+        NEIGHBOURS.iter().zip(pattern).all(|(offset, cond)| match cond {
+            Cond::Any => true,
+            Cond::Same => same(g.apply_offset(*offset)),
+            Cond::NotSame => !same(g.apply_offset(*offset)),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -477,6 +655,55 @@ mod tests {
     use super::presets::*;
     use super::*;
     use std::collections::HashSet;
+
+    /// Mirror off picks the same kind of tile, facing the same way, as the mirrored rules do — for
+    /// every neighbourhood, whole tiles and quarters alike.
+    #[test]
+    fn two_surface_matches_the_mirrored_rules() {
+        let mirrored = two_surface(true);
+        let off = two_surface(false);
+        let t = |s: &TwoSurface| Terrain { name: "t".into(), tileset: String::new(), rules: s.rules.clone(), fallback: None, quarters: s.quarters.clone() };
+        let (mt, ot) = (t(&mirrored), t(&off));
+        // What a slot drawn in an orientation looks like: the role and which ways it is open.
+        let look = |role: u32, o: D4| {
+            let mut dirs: Vec<IVec2> = [
+                &[IVec2::new(0, -1), IVec2::new(-1, 0)][..],
+                &[IVec2::new(0, -1)],
+                &[IVec2::new(0, -1), IVec2::new(-1, 0), IVec2::new(1, 0)],
+                &[IVec2::new(-1, 0), IVec2::new(1, 0)],
+                &[],
+                &[IVec2::new(1, -1)],
+                &[IVec2::new(-1, -1), IVec2::new(1, -1)],
+            ][role as usize]
+                .iter()
+                .map(|d| o.apply_offset(*d))
+                .collect();
+            dirs.sort_by_key(|d| (d.x, d.y));
+            (role, dirs)
+        };
+        for mask in 0..=255u8 {
+            let same = |d: IVec2| NEIGHBOURS.iter().position(|n| *n == d).is_none_or(|s| mask & (1 << s) != 0);
+            match (mt.choose(same).unwrap(), ot.choose(same).unwrap()) {
+                (Choice::Whole { tile, transform }, Choice::Whole { tile: slot, transform: id }) => {
+                    assert!(id.is_identity());
+                    let s = &off.slots[slot as usize];
+                    assert_eq!(look(tile, transform), look(s.role, s.orientation), "mask {mask:08b}");
+                }
+                (Choice::Quarters(a), Choice::Quarters(b)) => {
+                    for (qa, qb) in a.iter().zip(&b) {
+                        assert_eq!(qa.place, qb.place);
+                        assert_eq!(qb.transform, qb.place, "a quarter is cut from its own corner");
+                        let s = &off.slots[qb.tile as usize];
+                        assert_eq!(look(qa.tile, qa.place.after(qa.transform)), look(s.role, s.orientation), "mask {mask:08b}");
+                    }
+                }
+                (a, b) => panic!("mask {mask:08b}: mirrored draws {a:?}, mirror off {b:?}"),
+            }
+        }
+        let names: HashSet<&str> = off.slots.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names.len(), off.slots.len(), "slot names are unique: {:?}", off.slots);
+        println!("{} slots: {:?}", off.slots.len(), off.slots.iter().map(|s| &s.name).collect::<Vec<_>>());
+    }
 
     const CORNER: u32 = 0;
     const TOP: u32 = 1;

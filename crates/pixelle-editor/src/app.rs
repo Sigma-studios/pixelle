@@ -1,18 +1,20 @@
-//! The editor: its state, the window layout, menus, shortcuts and files.
+//! The editor: its state, the window layout, menus, shortcuts, tabs and files.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers};
-use pixelle_core::layer::LayerKind;
+use pixelle_core::folder::{self, File, Preset, ProjectDir, SpriteFile, TerrainFile};
 use pixelle_core::palette::presets;
 use pixelle_core::render::Indexed;
-use pixelle_core::{IRect, IVec2, LayerId, Project, bake, pack, png_io};
+use pixelle_core::{IRect, IVec2, LayerId, Project, bake, png_io};
 
 use crate::backend::{CanvasBackend, CpuTiles};
-use crate::doc::{Document, autosave_path};
+use crate::doc::Document;
 use crate::tools::Tool;
 use crate::view::View;
+use crate::workspace::{self, Disk, TabKind};
 
 const AUTOSAVE_EVERY: Duration = Duration::from_secs(30);
 const WATCH_EVERY: Duration = Duration::from_secs(1);
@@ -22,8 +24,6 @@ const WATCH_EVERY: Duration = Duration::from_secs(1);
 pub enum Selected {
     None,
     Sprite { name: String, frame: usize },
-    Instance { layer: LayerId, index: usize },
-    Terrain(usize),
 }
 
 /// Pixels lifted off a layer (or pasted) and not yet put down.
@@ -44,10 +44,7 @@ pub enum Drag {
     Shape { start: IVec2, value: u8 },
     Select { start: IVec2 },
     MoveFloating { grab: IVec2 },
-    NewSprite { start: IVec2 },
-    MoveFrame { name: String, frame: usize, grab: IVec2, orig: IRect },
-    ResizeFrame { name: String, frame: usize, orig: IRect },
-    MoveInstance { layer: LayerId, index: usize, grab: IVec2, orig: IVec2 },
+    ResizeFrame { frame: usize, orig: IRect },
     Terrain { value: u8, last: IVec2 },
     Minimap,
 }
@@ -69,89 +66,145 @@ pub struct Shot {
     pub requested: bool,
 }
 
-pub struct Editor {
+/// A tab's canvas and how it was being looked at, while another tab is in front.
+pub struct TabState {
     pub doc: Document,
     pub view: View,
-    pub backend: Box<dyn CanvasBackend>,
+    pub active_layer: Option<LayerId>,
+    pub selected: Selected,
     pub tool: Tool,
+    pub fit_pending: bool,
+}
+
+pub struct Tab {
+    pub kind: TabKind,
+    /// `None` for the tab in front, whose state lives in the editor itself.
+    pub state: Option<TabState>,
+}
+
+/// A dialog waiting on the person.
+pub enum Modal {
+    NewFile { name: String, terrain: bool, w: u32, h: u32, cell: u32, error: Option<String> },
+    Rename { from: String, to: String, error: Option<String> },
+    Delete(String),
+    Recover(BTreeMap<String, String>),
+    /// Files changed on disk while there were unsaved changes to them.
+    DiskChanged(Vec<String>),
+    Close,
+}
+
+pub struct Editor {
+    /// The project, as files. Open tabs hold newer copies of their own files until written back.
+    pub project: ProjectDir,
+    /// `None` until a folder is opened: everything stays in memory.
+    pub disk: Option<Disk>,
+    pub tabs: Vec<Tab>,
+    pub active: usize,
+    /// Assets changed and not saved whose tabs are closed, and `project` for the root.
+    pub unsaved: BTreeSet<String>,
+    /// Files to delete on the next save: renamed or deleted assets.
+    pub pending_delete: BTreeSet<String>,
+    /// The project before the last colour inserted or deleted, while nothing has changed since.
+    palette_undo: Option<(String, ProjectDir, BTreeSet<String>)>,
+
+    // The tab in front.
+    pub doc: Document,
+    pub view: View,
+    pub active_layer: Option<LayerId>,
+    pub selected: Selected,
+    pub tool: Tool,
+    pub fit_pending: bool,
+
+    pub backend: Box<dyn CanvasBackend>,
     pub primary: u8,
     pub secondary: u8,
-    pub active_layer: Option<LayerId>,
     /// The terrain the terrain brush paints (a terrain layer cell value).
     pub active_terrain: u8,
     pub opts: Options,
-    pub selected: Selected,
     pub selection: Option<IRect>,
     pub floating: Option<Floating>,
     pub clipboard: Option<Indexed>,
     pub drag: Option<Drag>,
-    /// Waiting for a click to place this anchor point on the selected sprite frame.
+    /// Waiting for a click to place this anchor point on the selected frame.
     pub placing_point: Option<String>,
     pub highlight: Option<u8>,
-    pub sprite_filter: String,
+    pub file_filter: String,
     pub clock: Instant,
     pub status: Option<(String, Instant)>,
     pub problems: (u64, Vec<String>),
-    pub fit_pending: bool,
     pub zoom_acc: f32,
     pub canvas_rect: egui::Rect,
     pub pending_tiles: bool,
+    pub modal: Option<Modal>,
     next_key: u64,
     autosave_at: Instant,
     watch_at: Instant,
-    recover: Option<PathBuf>,
-    disk_changed: bool,
-    confirm_close: bool,
     allow_close: bool,
     title: String,
     pub shot: Option<Shot>,
     pub new_point_name: String,
-    /// The end of a line, rectangle or new sprite being dragged.
+    /// The end of a line or rectangle being dragged.
     pub shape_end: Option<IVec2>,
     pub shape_filled: bool,
-    /// Dragging a new sprite off the grid.
-    pub free_drag: bool,
-    /// The sprite the instance tool places.
-    pub last_sprite: Option<String>,
     /// Where each animation's preview goes, worked out at a revision.
     pub previews: (u64, std::collections::HashMap<String, IRect>),
     pub pending_fit_rect: Option<IRect>,
 }
 
 pub struct Args {
-    pub file: Option<PathBuf>,
+    /// The project folder, or its `project.pxl`.
+    pub project: Option<PathBuf>,
+    /// Open the project opened last, when none is given.
+    pub remember: bool,
     pub screenshot: Option<PathBuf>,
-    pub view: Option<String>,
+    /// An asset to open in a tab.
+    pub open: Option<String>,
     pub zoom: Option<f32>,
-    pub select: Option<String>,
     pub tool: Option<String>,
     pub layer: Option<String>,
 }
 
+/// Where the last project opened is remembered.
+fn last_project_file() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".config/pixelle/last-project"))
+}
+
+fn folder_of(path: &Path) -> PathBuf {
+    if path.file_name().is_some_and(|n| n == folder::ROOT) {
+        path.parent().unwrap_or(Path::new(".")).to_path_buf()
+    } else {
+        path.to_path_buf()
+    }
+}
+
+pub fn new_project(name: &str, preset: presets::Preset) -> ProjectDir {
+    let mut p = ProjectDir::new(name);
+    let _ = presets::add(&mut p.palette, preset);
+    p
+}
+
 impl Editor {
     pub fn new(args: Args) -> anyhow::Result<Self> {
-        let (doc, recover) = match &args.file {
-            Some(path) if path.exists() => {
-                let doc = Document::open(path)?;
-                let auto = autosave_path(path);
-                let newer = |a: &Path, b: &Path| {
-                    let t = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
-                    matches!((t(a), t(b)), (Some(x), Some(y)) if x > y)
-                };
-                let recover = (auto.exists() && newer(&auto, path)).then_some(auto);
-                (doc, recover)
-            }
-            Some(path) => (Document::new(new_project(presets::DB32), Some(path.clone())), None),
-            None => (Document::new(new_project(presets::DB32), None), None),
-        };
+        let project = new_project("untitled", presets::DB32);
+        let sandbox = workspace::sandbox_canvas(&project);
         let mut ed = Editor {
-            doc,
+            project,
+            disk: None,
+            tabs: vec![Tab { kind: TabKind::Sandbox, state: None }],
+            active: 0,
+            unsaved: BTreeSet::new(),
+            pending_delete: BTreeSet::new(),
+            palette_undo: None,
+            doc: Document::new(sandbox),
             view: View::default(),
-            backend: Box::new(CpuTiles::default()),
+            active_layer: None,
+            selected: Selected::None,
             tool: Tool::Pencil,
+            fit_pending: true,
+            backend: Box::new(CpuTiles::default()),
             primary: 1,
             secondary: 0,
-            active_layer: None,
             active_terrain: 1,
             opts: Options {
                 pixel_grid: true,
@@ -162,39 +215,53 @@ impl Editor {
                 mirror: false,
                 minimap: true,
             },
-            selected: Selected::None,
             selection: None,
             floating: None,
             clipboard: None,
             drag: None,
             placing_point: None,
             highlight: None,
-            sprite_filter: String::new(),
+            file_filter: String::new(),
             clock: Instant::now(),
             status: None,
             problems: (u64::MAX, Vec::new()),
-            fit_pending: true,
             zoom_acc: 1.0,
             canvas_rect: egui::Rect::NOTHING,
             pending_tiles: false,
+            modal: None,
             next_key: 1,
             autosave_at: Instant::now(),
             watch_at: Instant::now(),
-            recover,
-            disk_changed: false,
-            confirm_close: false,
             allow_close: false,
             title: String::new(),
             shot: args.screenshot.map(|path| Shot { path, frames: 0, requested: false }),
             new_point_name: String::new(),
             shape_end: None,
             shape_filled: false,
-            free_drag: false,
-            last_sprite: None,
             previews: (u64::MAX, Default::default()),
             pending_fit_rect: None,
         };
-        ed.after_load();
+        ed.settle_tab();
+        let remember = args.remember;
+        let path = args.project.or_else(|| {
+            if !remember {
+                return None;
+            }
+            let remembered = std::fs::read_to_string(last_project_file()?).ok()?;
+            let p = PathBuf::from(remembered.trim());
+            p.join(folder::ROOT).exists().then_some(p)
+        });
+        if let Some(path) = path {
+            ed.open_project(&folder_of(&path))?;
+        }
+        if let Some(name) = args.open {
+            let kind = match ed.project.kind(&name) {
+                Some(folder::Kind::Sprite) => TabKind::Sprite(name),
+                Some(folder::Kind::Terrain) => TabKind::Terrain(name),
+                None => anyhow::bail!("no file {name:?} in the project"),
+            };
+            ed.open_tab(kind);
+        }
         if let Some(name) = args.layer {
             ed.active_layer = ed.doc.project.layer_named(&name).map(|l| l.id);
         }
@@ -204,43 +271,11 @@ impl Editor {
                 .find(|x| x.name().eq_ignore_ascii_case(&t))
                 .ok_or_else(|| anyhow::anyhow!("no tool {t:?}"))?;
         }
-        if let Some(name) = args.select {
-            let b = ed.doc.project.sprite(&name).map(|s| s.bounds());
-            let b = b.ok_or_else(|| anyhow::anyhow!("no sprite {name:?}"))?;
-            ed.view.center = egui::vec2(b.x as f32 + b.w as f32 / 2.0, b.y as f32 + b.h as f32 / 2.0);
-            ed.fit_pending = false;
-            ed.select_sprite(&name, 0);
-        }
-        if let Some(v) = args.view {
-            let b = ed.doc.project.bookmarks.iter().find(|b| b.name == v);
-            let b = b.ok_or_else(|| anyhow::anyhow!("no bookmark {v:?}"))?;
-            ed.view.center = egui::vec2(b.rect.x as f32 + b.rect.w as f32 / 2.0, b.rect.y as f32 + b.rect.h as f32 / 2.0);
-            ed.fit_pending = args.zoom.is_none();
-            if ed.fit_pending {
-                ed.pending_fit_rect = Some(b.rect);
-            }
-        }
         if let Some(z) = args.zoom {
             ed.view.zoom = z;
             ed.fit_pending = false;
         }
         Ok(ed)
-    }
-
-    fn after_load(&mut self) {
-        let p = &self.doc.project;
-        self.active_layer = p
-            .layers
-            .iter()
-            .find(|l| l.pixels().is_some() && !l.reference)
-            .or(p.layers.last())
-            .map(|l| l.id);
-        self.primary = if p.palette.len() > 1 { 1 } else { 0 };
-        self.secondary = 0;
-        self.selected = Selected::None;
-        self.selection = None;
-        self.floating = None;
-        self.fit_pending = true;
     }
 
     pub fn key(&mut self) -> u64 {
@@ -256,12 +291,397 @@ impl Editor {
         self.clock.elapsed().as_secs_f32()
     }
 
+    pub fn kind(&self) -> &TabKind {
+        &self.tabs[self.active].kind
+    }
+
+    // --- Projects ------------------------------------------------------------------------------
+
+    /// Open a project folder, or start one in it if it has no `project.pxl`.
+    pub fn open_project(&mut self, dir: &Path) -> anyhow::Result<()> {
+        let project = if dir.join(folder::ROOT).exists() {
+            ProjectDir::load(dir)?
+        } else {
+            let name = dir.file_name().map_or("untitled".into(), |n| n.to_string_lossy().into_owned());
+            let p = new_project(&name, presets::DB32);
+            p.save(dir)?;
+            p
+        };
+        let mut disk = Disk::new(dir.to_path_buf());
+        disk.note_all(&project);
+        let recover = disk.recoverable();
+        self.project = project;
+        self.disk = Some(disk);
+        self.unsaved.clear();
+        self.pending_delete.clear();
+        self.palette_undo = None;
+        self.floating = None;
+        self.selection = None;
+        self.tabs = vec![Tab { kind: TabKind::Sandbox, state: None }];
+        self.active = 0;
+        self.doc = Document::new(workspace::sandbox_canvas(&self.project));
+        self.view = View::default();
+        self.selected = Selected::None;
+        self.fit_pending = true;
+        self.settle_tab();
+        self.primary = if self.project.palette.len() > 1 { 1 } else { 0 };
+        self.secondary = 0;
+        if !recover.is_empty() {
+            self.modal = Some(Modal::Recover(recover));
+        }
+        if let Some(f) = last_project_file().filter(|_| self.shot.is_none() && !cfg!(test)) {
+            let _ = std::fs::create_dir_all(f.parent().unwrap_or(Path::new(".")));
+            let _ = std::fs::write(f, dir.display().to_string());
+        }
+        self.say(format!("Opened {}", dir.display()));
+        Ok(())
+    }
+
+    pub fn pick_project(&mut self) {
+        if !self.confirm_discard() {
+            return;
+        }
+        if let Some(dir) = rfd::FileDialog::new().set_title("Open or start a project folder").pick_folder()
+            && let Err(e) = self.open_project(&dir)
+        {
+            self.say(format!("Could not open {}: {e}", dir.display()));
+        }
+    }
+
+    fn confirm_discard(&self) -> bool {
+        !self.any_unsaved()
+            || rfd::MessageDialog::new()
+                .set_title("Discard changes?")
+                .set_description("The open project has unsaved changes. Discard them?")
+                .set_buttons(rfd::MessageButtons::YesNo)
+                .show()
+                == rfd::MessageDialogResult::Yes
+    }
+
+    pub fn any_unsaved(&self) -> bool {
+        !self.unsaved.is_empty() || !self.pending_delete.is_empty() || self.doc.dirty || self.tabs.iter().any(|t| t.state.as_ref().is_some_and(|s| s.doc.dirty))
+    }
+
+    /// Whether an asset (or `project`, the root) has changes not on disk.
+    pub fn is_unsaved(&self, asset: &str) -> bool {
+        self.unsaved.contains(asset)
+            || self.tabs.iter().enumerate().any(|(i, t)| {
+                t.kind.asset() == Some(asset) && if i == self.active { self.doc.dirty } else { t.state.as_ref().is_some_and(|s| s.doc.dirty) }
+            })
+    }
+
+    // --- Tabs ----------------------------------------------------------------------------------
+
+    /// The canvas of tab `i`, wherever it is kept.
+    fn tab_doc(&self, i: usize) -> &Document {
+        if i == self.active { &self.doc } else { &self.tabs[i].state.as_ref().expect("a tab behind keeps its state").doc }
+    }
+
+    fn tab_doc_mut(&mut self, i: usize) -> &mut Document {
+        if i == self.active { &mut self.doc } else { &mut self.tabs[i].state.as_mut().expect("a tab behind keeps its state").doc }
+    }
+
+    /// Read every open tab's canvas back into the project.
+    pub fn write_back_all(&mut self) {
+        self.commit_floating();
+        for i in 0..self.tabs.len() {
+            let kind = self.tabs[i].kind.clone();
+            if kind == TabKind::Sandbox {
+                continue;
+            }
+            let doc = if i == self.active { &self.doc } else { &self.tabs[i].state.as_ref().expect("kept").doc };
+            if doc.dirty {
+                let canvas = doc.project.clone();
+                workspace::write_back(&mut self.project, &kind, &canvas);
+            }
+        }
+    }
+
+    /// Put the tab in front away, with how it was being looked at.
+    fn stash(&mut self) {
+        self.commit_floating();
+        self.drag = None;
+        self.placing_point = None;
+        self.selection = None;
+        let blank = Document::new(Project::new(""));
+        let state = TabState {
+            doc: std::mem::replace(&mut self.doc, blank),
+            view: self.view,
+            active_layer: self.active_layer,
+            selected: std::mem::replace(&mut self.selected, Selected::None),
+            tool: self.tool,
+            fit_pending: self.fit_pending,
+        };
+        self.tabs[self.active].state = Some(state);
+    }
+
+    /// Bring tab `i` to the front.
+    pub fn activate(&mut self, i: usize) {
+        if i == self.active || i >= self.tabs.len() {
+            return;
+        }
+        self.stash();
+        self.active = i;
+        let s = self.tabs[i].state.take().expect("a tab behind keeps its state");
+        self.doc = s.doc;
+        self.view = s.view;
+        self.active_layer = s.active_layer;
+        self.selected = s.selected;
+        self.tool = s.tool;
+        self.fit_pending = s.fit_pending;
+        if self.tabs[i].kind == TabKind::Sandbox {
+            self.refresh_sandbox();
+        }
+        self.doc.touch_all();
+        self.backend = Box::new(CpuTiles::default());
+        self.previews = (u64::MAX, Default::default());
+        self.fix_selection();
+    }
+
+    /// Open `kind` in a tab, or bring its tab to the front.
+    pub fn open_tab(&mut self, kind: TabKind) {
+        if let Some(i) = self.tabs.iter().position(|t| t.kind == kind) {
+            self.activate(i);
+            return;
+        }
+        let Some(canvas) = workspace::canvas_for(&self.project, &kind) else {
+            self.say("No such file");
+            return;
+        };
+        let mut doc = Document::new(canvas);
+        doc.clip = kind != TabKind::Sandbox;
+        // A file closed with unsaved changes reopens with them still unsaved.
+        if let Some(a) = kind.asset()
+            && self.unsaved.remove(a)
+        {
+            doc.dirty = true;
+        }
+        self.tabs.push(Tab {
+            kind,
+            state: Some(TabState { doc, view: View::default(), active_layer: None, selected: Selected::None, tool: Tool::Pencil, fit_pending: true }),
+        });
+        let i = self.tabs.len() - 1;
+        self.activate(i);
+        self.settle_tab();
+    }
+
+    /// A sensible layer, tool and selection for a tab just opened.
+    fn settle_tab(&mut self) {
+        let p = &self.doc.project;
+        match self.tabs[self.active].kind.clone() {
+            TabKind::Sandbox => {
+                self.active_layer = p.layers.iter().find(|l| matches!(l.kind, pixelle_core::layer::LayerKind::Terrain(_))).map(|l| l.id);
+                self.tool = if p.terrains.is_empty() { Tool::Pencil } else { Tool::Terrain };
+                if p.terrains.is_empty() {
+                    self.active_layer = p.layers.iter().rev().find(|l| l.pixels().is_some() && l.visible).map(|l| l.id);
+                }
+                self.active_terrain = 1;
+                let g = self.project.grid.max(1) as i32;
+                self.pending_fit_rect = Some(IRect::new(-4 * g, -4 * g, 24 * g as u32, 14 * g as u32));
+            }
+            TabKind::Sprite(name) => {
+                self.active_layer = p.layers.iter().find(|l| l.pixels().is_some() && !l.reference).or(p.layers.first()).map(|l| l.id);
+                self.tool = Tool::Pencil;
+                self.selected = Selected::Sprite { name, frame: 0 };
+            }
+            TabKind::Terrain(_) => {
+                self.active_layer = p.layers.first().map(|l| l.id);
+                self.tool = Tool::Pencil;
+                self.active_terrain = 1;
+            }
+        }
+        self.fit_pending = true;
+    }
+
+    pub fn close_tab(&mut self, i: usize) {
+        if self.tabs[i].kind == TabKind::Sandbox {
+            return;
+        }
+        if i == self.active {
+            self.commit_floating();
+        }
+        let kind = self.tabs[i].kind.clone();
+        let doc = self.tab_doc(i);
+        if doc.dirty {
+            let canvas = doc.project.clone();
+            workspace::write_back(&mut self.project, &kind, &canvas);
+            if let Some(a) = kind.asset() {
+                self.unsaved.insert(a.to_string());
+            }
+        }
+        if i == self.active {
+            let to = if i > 0 { i - 1 } else { 0 };
+            self.stash();
+            self.tabs.remove(i);
+            // Nothing is in front for a moment: put the neighbour there.
+            self.active = usize::MAX;
+            let to = to.min(self.tabs.len() - 1);
+            let s = self.tabs[to].state.take().expect("kept");
+            self.active = to;
+            self.doc = s.doc;
+            self.view = s.view;
+            self.active_layer = s.active_layer;
+            self.selected = s.selected;
+            self.tool = s.tool;
+            self.fit_pending = s.fit_pending;
+            if self.tabs[to].kind == TabKind::Sandbox {
+                self.refresh_sandbox();
+            }
+            self.doc.touch_all();
+            self.backend = Box::new(CpuTiles::default());
+            self.previews = (u64::MAX, Default::default());
+        } else {
+            self.tabs.remove(i);
+            if i < self.active {
+                self.active -= 1;
+            }
+        }
+    }
+
+    fn refresh_sandbox(&mut self) {
+        self.write_back_all();
+        let i = self.tabs.iter().position(|t| t.kind == TabKind::Sandbox).expect("the Sandbox is always open");
+        let project = self.project.clone();
+        let doc = self.tab_doc_mut(i);
+        workspace::refresh_sandbox(&mut doc.project, &project);
+        doc.touch_all();
+    }
+
+    /// Rebuild every tab's canvas from the project, after something changed under all of them.
+    /// Undo history goes with the old canvases.
+    fn rebuild_tabs(&mut self) {
+        self.commit_floating();
+        for i in 0..self.tabs.len() {
+            let kind = self.tabs[i].kind.clone();
+            let Some(canvas) = workspace::canvas_for(&self.project, &kind) else { continue };
+            let (dirty, layer_name) = {
+                let d = self.tab_doc(i);
+                let layer = if i == self.active { self.active_layer } else { self.tabs[i].state.as_ref().and_then(|s| s.active_layer) };
+                (d.dirty, layer.and_then(|l| d.project.layer(l)).map(|l| l.name.clone()))
+            };
+            let canvas = if kind == TabKind::Sandbox {
+                // Keep what was painted there: it is in no file.
+                let mut p = self.tab_doc(i).project.clone();
+                workspace::refresh_sandbox(&mut p, &self.project);
+                p
+            } else {
+                canvas
+            };
+            let mut doc = Document::new(canvas);
+            doc.clip = kind != TabKind::Sandbox;
+            doc.dirty = dirty;
+            let layer = layer_name.and_then(|n| doc.project.layer_named(&n)).map(|l| l.id);
+            if i == self.active {
+                self.doc = doc;
+                self.active_layer = layer.or(self.active_layer);
+            } else if let Some(s) = &mut self.tabs[i].state {
+                s.doc = doc;
+                s.active_layer = layer.or(s.active_layer);
+            }
+        }
+        self.doc.touch_all();
+        self.backend = Box::new(CpuTiles::default());
+        self.fix_selection();
+    }
+
+    // --- The palette and recolour slots, shared by every file ----------------------------------
+
+    /// Carry palette and recolour-slot edits made in the tab in front to the project and every
+    /// other tab. Edits that move indices go through [`Editor::insert_color`] and
+    /// [`Editor::remove_color`] instead.
+    fn share_project_wide(&mut self) {
+        let (pal, swaps) = (&self.doc.project.palette, &self.doc.project.swaps);
+        if *pal == self.project.palette && *swaps == self.project.swaps {
+            return;
+        }
+        self.project.palette = pal.clone();
+        self.project.swaps = swaps.clone();
+        let (pal, swaps) = (self.project.palette.clone(), self.project.swaps.clone());
+        for (i, t) in self.tabs.iter_mut().enumerate() {
+            if i == self.active {
+                continue;
+            }
+            if let Some(s) = &mut t.state {
+                s.doc.project.palette = pal.clone();
+                s.doc.project.swaps = swaps.clone();
+                s.doc.touch_all();
+            }
+        }
+        self.unsaved.insert("project".into());
+    }
+
+    /// Put the project's palette in every tab, after something outside the tabs changed it.
+    fn broadcast_palette(&mut self) {
+        let (pal, swaps) = (self.project.palette.clone(), self.project.swaps.clone());
+        for i in 0..self.tabs.len() {
+            let d = self.tab_doc_mut(i);
+            d.project.palette = pal.clone();
+            d.project.swaps = swaps.clone();
+            d.touch_all();
+        }
+    }
+
+    /// Run a change that moves palette indices over the whole project: every file, open or not.
+    /// It is one undo step of its own, available until anything else changes.
+    fn reindex(&mut self, label: &str, f: impl FnOnce(&mut ProjectDir) -> Vec<String>) {
+        self.write_back_all();
+        let before = (label.to_string(), self.project.clone(), self.unsaved.clone());
+        let dirty: Vec<String> = (0..self.tabs.len()).filter(|&i| self.tab_doc(i).dirty).filter_map(|i| self.tabs[i].kind.asset().map(str::to_string)).collect();
+        let changed = f(&mut self.project);
+        self.unsaved.extend(changed);
+        self.unsaved.extend(dirty);
+        self.unsaved.insert("project".into());
+        // Open files are rebuilt from the project; whatever they had unsaved is in `unsaved` now.
+        for i in 0..self.tabs.len() {
+            self.tab_doc_mut(i).dirty = false;
+        }
+        self.rebuild_tabs();
+        for i in 0..self.tabs.len() {
+            if let Some(a) = self.tabs[i].kind.asset().map(str::to_string)
+                && self.unsaved.remove(&a)
+            {
+                self.tab_doc_mut(i).dirty = true;
+            }
+        }
+        self.palette_undo = Some(before);
+    }
+
+    /// Add a colour at the end of a palette section. Returns its index.
+    pub fn insert_color(&mut self, section: usize, name: &str, rgba: [u8; 4]) -> Option<u8> {
+        let mut at = None;
+        self.reindex("Add colour", |p| {
+            let before = p.clone();
+            at = p.insert_color(section, name, rgba).ok();
+            changed_assets(&before, p)
+        });
+        at
+    }
+
+    /// Delete a colour; its pixels become `replace` (an index as it is now).
+    pub fn remove_color(&mut self, index: u8, replace: u8) {
+        self.reindex("Delete colour", |p| {
+            let before = p.clone();
+            p.remove_color(index, replace);
+            changed_assets(&before, p)
+        });
+        self.fix_selection();
+    }
+
     // --- Edits that must not leave a floating selection behind ------------------------------
 
-    /// Change the project as one undo step, putting down any floating selection first.
+    /// Change the canvas as one undo step, putting down any floating selection first.
     pub fn edit(&mut self, label: &str, key: Option<&str>, f: impl FnOnce(&mut Project)) {
         self.commit_floating();
         self.doc.edit(label, key, f);
+    }
+
+    /// Change the open sprite's file as one undo step — add, remove, reorder or resize frames —
+    /// and lay its canvas out again.
+    pub fn edit_sprite(&mut self, label: &str, key: Option<&str>, f: impl FnOnce(&mut SpriteFile)) {
+        let layer = self.active_layer.and_then(|l| self.doc.project.layer(l)).map(|l| l.name.clone());
+        self.edit(label, key, |p| *p = workspace::reshape_sprite(p, f));
+        self.active_layer = layer.and_then(|n| self.doc.project.layer_named(&n)).map(|l| l.id).or(self.active_layer);
+        self.fix_selection();
     }
 
     /// Put floating pixels down where they are.
@@ -356,18 +776,6 @@ impl Editor {
             self.selection = None;
             return;
         }
-        if let (Selected::Instance { layer, index }, Tool::Instance) = (&self.selected, self.tool) {
-            let (layer, index) = (*layer, *index);
-            self.edit("Delete instance", None, |p| {
-                if let Some(LayerKind::Instances(list)) = p.layer_mut(layer).map(|l| &mut l.kind)
-                    && index < list.len()
-                {
-                    list.remove(index);
-                }
-            });
-            self.selected = Selected::None;
-            return;
-        }
         let (Some(sel), Some(layer)) = (self.selection, self.pixel_layer()) else { return };
         self.doc.begin(layer, "Delete");
         for y in 0..sel.h {
@@ -400,8 +808,31 @@ impl Editor {
         }
     }
 
+    /// Whether the last colour insert or delete can still be undone: nothing has changed since.
+    pub fn can_undo_palette(&self) -> Option<&str> {
+        let quiet = (0..self.tabs.len()).all(|i| !self.tab_doc(i).has_history());
+        self.palette_undo.as_ref().filter(|_| quiet).map(|(l, ..)| l.as_str())
+    }
+
     pub fn undo(&mut self) {
         self.commit_floating();
+        if !self.doc.has_history()
+            && self.can_undo_palette().is_some()
+            && let Some((label, project, unsaved)) = self.palette_undo.take()
+        {
+            self.project = project;
+            self.unsaved = unsaved;
+            for i in 0..self.tabs.len() {
+                if let Some(a) = self.tabs[i].kind.asset().map(str::to_string)
+                    && self.unsaved.remove(&a)
+                {
+                    self.tab_doc_mut(i).dirty = true;
+                }
+            }
+            self.rebuild_tabs();
+            self.say(format!("Undid {label}"));
+            return;
+        }
         match self.doc.undo() {
             Some(l) => self.say(format!("Undid {l}")),
             None => self.say("Nothing to undo"),
@@ -421,19 +852,18 @@ impl Editor {
     /// Drop references that an undo or reload may have invalidated.
     pub fn fix_selection(&mut self) {
         let p = &self.doc.project;
-        if self.active_layer.is_some_and(|id| p.layer(id).is_none()) {
-            self.active_layer = p.layers.last().map(|l| l.id);
+        if self.active_layer.is_none_or(|id| p.layer(id).is_none()) {
+            self.active_layer = p.layers.iter().rev().find(|l| l.visible).or(p.layers.last()).map(|l| l.id);
         }
         let ok = match &self.selected {
             Selected::None => true,
             Selected::Sprite { name, frame } => p.sprite(name).is_some_and(|s| *frame < s.frames.len()),
-            Selected::Instance { layer, index } => {
-                matches!(p.layer(*layer).map(|l| &l.kind), Some(LayerKind::Instances(v)) if *index < v.len())
-            }
-            Selected::Terrain(i) => *i < p.terrains.len(),
         };
         if !ok {
-            self.selected = Selected::None;
+            self.selected = match p.sprites.first() {
+                Some(s) => Selected::Sprite { name: s.name.clone(), frame: 0 },
+                None => Selected::None,
+            };
         }
         if self.primary as usize >= p.palette.len() {
             self.primary = 0;
@@ -451,82 +881,304 @@ impl Editor {
 
     // --- Files ---------------------------------------------------------------------------------
 
-    fn confirm_discard(&self) -> bool {
-        !self.doc.dirty
-            || rfd::MessageDialog::new()
-                .set_title("Discard changes?")
-                .set_description("The open project has unsaved changes. Discard them?")
-                .set_buttons(rfd::MessageButtons::YesNo)
-                .show()
-                == rfd::MessageDialogResult::Yes
-    }
-
-    pub fn new_file(&mut self, preset: presets::Preset) {
-        if !self.confirm_discard() {
+    /// Write every changed file, and delete the ones renamed or deleted.
+    pub fn save(&mut self) {
+        self.write_back_all();
+        let Some(disk) = &mut self.disk else {
+            self.say("Open a project folder to save into: File → Open project…");
             return;
-        }
-        self.doc = Document::new(new_project(preset), None);
-        self.after_load();
-    }
-
-    pub fn open(&mut self) {
-        if !self.confirm_discard() {
-            return;
-        }
-        if let Some(path) = rfd::FileDialog::new().add_filter("Pixelle", &["pxl"]).pick_file() {
-            self.open_path(&path);
-        }
-    }
-
-    pub fn open_path(&mut self, path: &Path) {
-        match Document::open(path) {
-            Ok(doc) => {
-                self.doc = doc;
-                self.after_load();
-                self.say(format!("Opened {}", path.display()));
+        };
+        let written = match self.project.save(&disk.dir) {
+            Ok(w) => w,
+            Err(e) => return self.say(format!("Save failed: {e}")),
+        };
+        let keep: BTreeSet<String> = self.project.to_files().into_keys().collect();
+        for rel in std::mem::take(&mut self.pending_delete) {
+            if !keep.contains(&rel) {
+                let _ = std::fs::remove_file(disk.path(&rel));
             }
-            Err(e) => self.say(format!("Could not open {}: {e}", path.display())),
         }
+        disk.note_all(&self.project);
+        disk.clear_autosave();
+        self.unsaved.clear();
+        for i in 0..self.tabs.len() {
+            self.tab_doc_mut(i).dirty = false;
+        }
+        let n = written.len();
+        self.say(if n == 0 { "Nothing to save".to_string() } else { format!("Saved {n} file{}", if n == 1 { "" } else { "s" }) });
     }
 
-    pub fn save(&mut self, choose: bool) {
-        self.commit_floating();
-        if choose || self.doc.path.is_none() {
-            let name = format!("{}.pxl", self.doc.project.name);
-            let Some(path) = rfd::FileDialog::new().add_filter("Pixelle", &["pxl"]).set_file_name(name).save_file() else {
-                return;
+    pub fn new_file(&mut self, name: &str, file: File) -> Result<(), String> {
+        workspace::valid_name(name)?;
+        if self.project.kind(name).is_some() {
+            return Err(format!("{name} already exists"));
+        }
+        let kind = match &file {
+            File::Sprite(_) => TabKind::Sprite(name.to_string()),
+            File::Terrain(_) => TabKind::Terrain(name.to_string()),
+            File::Project(_) => return Err("not a kind of file to make".into()),
+        };
+        self.project.insert(name, file).map_err(|e| e.to_string())?;
+        self.pending_delete.remove(&folder::file_name(name));
+        self.unsaved.insert(name.to_string());
+        self.unsaved.insert("project".into());
+        self.open_tab(kind);
+        Ok(())
+    }
+
+    pub fn rename(&mut self, from: &str, to: &str) -> Result<(), String> {
+        workspace::valid_name(to)?;
+        if from == to {
+            return Ok(());
+        }
+        if self.project.kind(to).is_some() {
+            return Err(format!("{to} already exists"));
+        }
+        self.write_back_all();
+        if let Some(s) = self.project.sprites.remove(from) {
+            self.project.sprites.insert(to.to_string(), s);
+        } else if let Some(t) = self.project.terrains.remove(from) {
+            self.project.terrains.insert(to.to_string(), t);
+        }
+        self.pending_delete.insert(folder::file_name(from));
+        self.pending_delete.remove(&folder::file_name(to));
+        self.unsaved.remove(from);
+        self.unsaved.insert(to.to_string());
+        self.unsaved.insert("project".into());
+        for i in 0..self.tabs.len() {
+            let renamed = match &self.tabs[i].kind {
+                TabKind::Sprite(n) if n == from => Some(TabKind::Sprite(to.to_string())),
+                TabKind::Terrain(n) if n == from => Some(TabKind::Terrain(to.to_string())),
+                _ => None,
             };
-            self.doc.path = Some(path);
+            if let Some(k) = renamed {
+                self.tabs[i].kind = k;
+                let d = self.tab_doc_mut(i);
+                for s in &mut d.project.sprites {
+                    s.name = to.to_string();
+                }
+                for t in &mut d.project.tilesets {
+                    t.name = to.to_string();
+                }
+                for t in &mut d.project.terrains {
+                    t.name = to.to_string();
+                    t.tileset = to.to_string();
+                }
+                d.touch_all();
+            }
         }
-        match self.doc.save() {
-            Ok(()) => self.say("Saved"),
-            Err(e) => self.say(format!("Save failed: {e}")),
+        if let Selected::Sprite { name, .. } = &mut self.selected
+            && name == from
+        {
+            *name = to.to_string();
+        }
+        Ok(())
+    }
+
+    pub fn duplicate(&mut self, name: &str) {
+        self.write_back_all();
+        let to = workspace::free_name(&self.project, &format!("{name} copy"));
+        let file = if let Some(s) = self.project.sprites.get(name) {
+            File::Sprite(s.clone())
+        } else if let Some(t) = self.project.terrains.get(name) {
+            File::Terrain(t.clone())
+        } else {
+            return;
+        };
+        if let Err(e) = self.new_file(&to, file) {
+            self.say(e);
         }
     }
 
-    fn anchor(&self) -> IVec2 {
-        IVec2::new(self.view.center.x.floor() as i32, self.view.center.y.floor() as i32)
+    pub fn delete(&mut self, name: &str) {
+        if let Some(i) = self.tabs.iter().position(|t| t.kind.asset() == Some(name)) {
+            self.tab_doc_mut(i).dirty = false;
+            self.close_tab(i);
+        }
+        self.project.remove(name);
+        self.unsaved.remove(name);
+        self.unsaved.insert("project".into());
+        self.pending_delete.insert(folder::file_name(name));
+        self.say(format!("Deleted {name}; saving removes its file"));
+    }
+
+    pub fn reveal(&mut self, name: &str) {
+        let Some(disk) = &self.disk else { return };
+        let path = disk.path(&folder::file_name(name));
+        let path = if path.exists() { path } else { disk.dir.clone() };
+        let r = if cfg!(target_os = "macos") {
+            std::process::Command::new("open").arg("-R").arg(&path).spawn()
+        } else if cfg!(target_os = "windows") {
+            std::process::Command::new("explorer").arg(format!("/select,{}", path.display())).spawn()
+        } else {
+            std::process::Command::new("xdg-open").arg(path.parent().unwrap_or(&path)).spawn()
+        };
+        if let Err(e) = r {
+            self.say(e.to_string());
+        }
+    }
+
+    /// Bring outside changes in: files another program wrote, made or deleted.
+    fn watch(&mut self) {
+        let Some(disk) = &self.disk else { return };
+        let changed: Vec<String> = disk.changed().into_iter().filter(|r| !self.pending_delete.contains(r)).collect();
+        if changed.is_empty() {
+            return;
+        }
+        let conflicts: Vec<String> = changed
+            .iter()
+            .filter(|rel| {
+                let asset = if *rel == folder::ROOT { "project".to_string() } else { folder::asset_name(rel) };
+                self.is_unsaved(&asset)
+            })
+            .cloned()
+            .collect();
+        if !conflicts.is_empty() {
+            if self.modal.is_none() {
+                self.modal = Some(Modal::DiskChanged(conflicts));
+            }
+            return;
+        }
+        self.load_from_disk(&changed);
+    }
+
+    /// Read `files` again from disk, whatever is in memory.
+    fn load_from_disk(&mut self, files: &[String]) {
+        let Some(disk) = &self.disk else { return };
+        let dir = disk.dir.clone();
+        if files.iter().any(|f| f == folder::ROOT) {
+            match ProjectDir::load(&dir) {
+                Ok(p) => {
+                    self.project = p;
+                    self.unsaved.clear();
+                    for i in 0..self.tabs.len() {
+                        self.tab_doc_mut(i).dirty = false;
+                    }
+                    self.tabs.retain(|t| t.kind.asset().is_none_or(|a| self.project.kind(a).is_some()) || t.state.is_none());
+                    self.active = self.active.min(self.tabs.len() - 1);
+                    self.rebuild_tabs();
+                    self.say("Reloaded the project: it changed on disk");
+                }
+                Err(e) => self.say(format!("The project changed on disk and does not read: {e}")),
+            }
+        } else {
+            for rel in files {
+                let asset = folder::asset_name(rel);
+                let path = dir.join(rel);
+                if !path.exists() {
+                    if let Some(i) = self.tabs.iter().position(|t| t.kind.asset() == Some(&asset)) {
+                        self.tab_doc_mut(i).dirty = false;
+                        self.close_tab(i);
+                    }
+                    self.project.remove(&asset);
+                    self.unsaved.insert("project".into());
+                    continue;
+                }
+                let read = std::fs::read(&path).map_err(|e| e.to_string()).and_then(|b| File::from_bytes(rel, &b).map_err(|e| e.to_string()));
+                match read {
+                    Ok(file) => {
+                        let new = self.project.kind(&asset).is_none();
+                        if self.project.insert(&asset, file).is_err() {
+                            continue;
+                        }
+                        if new {
+                            self.unsaved.insert("project".into());
+                        }
+                        if let Some(i) = self.tabs.iter().position(|t| t.kind.asset() == Some(&asset)) {
+                            let kind = self.tabs[i].kind.clone();
+                            if let Some(canvas) = workspace::canvas_for(&self.project, &kind) {
+                                let d = self.tab_doc_mut(i);
+                                d.edit("Reload from disk", None, |p| *p = canvas);
+                                d.dirty = false;
+                            }
+                        }
+                        self.say(format!("Reloaded {rel}: it changed on disk"));
+                    }
+                    Err(e) => self.say(format!("{rel} changed on disk and does not read: {e}")),
+                }
+            }
+            self.fix_selection();
+        }
+        if let Some(disk) = &mut self.disk {
+            for rel in files {
+                disk.note(rel);
+            }
+        }
+    }
+
+    fn autosave(&mut self) {
+        if self.disk.is_none() || !self.any_unsaved() {
+            return;
+        }
+        self.write_back_all();
+        let mut files = BTreeMap::new();
+        let all = self.project.to_files();
+        for (rel, text) in all {
+            let asset = if rel == folder::ROOT { "project".to_string() } else { folder::asset_name(&rel) };
+            if self.is_unsaved(&asset) || (rel == folder::ROOT && !self.pending_delete.is_empty()) {
+                files.insert(rel, text);
+            }
+        }
+        if let Some(disk) = &self.disk
+            && disk.autosave(&files).is_err()
+        {
+            self.say("Autosave failed");
+        }
+    }
+
+    fn recover(&mut self, files: BTreeMap<String, String>) {
+        for (rel, text) in files {
+            match File::from_text(&rel, &text) {
+                Ok(File::Project(m)) => {
+                    if let Ok(p) = ProjectDir::from_manifest(m.clone()) {
+                        self.project.palette = p.palette;
+                        self.project.swaps = p.swaps;
+                        self.project.grid = p.grid;
+                        // Files the autosaved root lists and the folder lacks were made since.
+                        for f in m.files {
+                            let a = folder::asset_name(&f);
+                            if self.project.kind(&a).is_none() {
+                                self.unsaved.insert(a);
+                            }
+                        }
+                        self.unsaved.insert("project".into());
+                    }
+                }
+                Ok(file) => {
+                    let a = folder::asset_name(&rel);
+                    if self.project.insert(&a, file).is_ok() {
+                        self.unsaved.insert(a);
+                    }
+                }
+                Err(e) => self.say(format!("Could not recover {rel}: {e}")),
+            }
+        }
+        self.broadcast_palette();
+        self.rebuild_tabs();
+        self.say("Recovered unsaved work; save to keep it");
     }
 
     pub fn import_png(&mut self) {
         let Some(path) = rfd::FileDialog::new().add_filter("PNG", &["png"]).pick_file() else { return };
-        let Some(layer) = self.pixel_layer() else {
-            self.say("Pick a pixel layer to import onto");
-            return;
-        };
         let img = match std::fs::read(&path).map_err(|e| e.to_string()).and_then(|b| png_io::decode(&b).map_err(|e| e.to_string())) {
             Ok(d) => d.to_rgba(),
             Err(e) => return self.say(format!("Could not read {}: {e}", path.display())),
         };
-        let at = self.anchor();
+        self.write_back_all();
         let mut report = pixelle_core::import::Report::default();
-        let mut err = None;
-        self.edit("Import PNG", None, |p| {
-            err = pixelle_core::import::paint_rgba(p, layer, at, &img, None, &mut report).err();
-        });
-        match err {
-            Some(e) => self.say(e),
-            None => self.say(format!("Imported {}x{}; {} new colours", img.w, img.h, report.added.len())),
+        let frame_w = if img.w > img.h && img.w % img.h == 0 { img.h } else { img.w };
+        match pixelle_core::import::sheet(&mut self.project.palette, &img, frame_w, None, &mut report) {
+            Ok(sprite) => {
+                self.broadcast_palette();
+                let base = path.file_stem().map_or("sprite".into(), |s| pixelle_core::import::snake(&s.to_string_lossy()));
+                let name = workspace::free_name(&self.project, &base);
+                let frames = sprite.frames.len();
+                if let Err(e) = self.new_file(&name, File::Sprite(sprite)) {
+                    return self.say(e);
+                }
+                self.say(format!("Imported {name}: {frames} frame(s), {} new colours", report.added.len()));
+            }
+            Err(e) => self.say(e),
         }
     }
 
@@ -534,23 +1186,26 @@ impl Editor {
         let Some(path) = rfd::FileDialog::new().add_filter("Aseprite", &["aseprite", "ase"]).pick_file() else {
             return;
         };
-        let Some(layer) = self.pixel_layer() else {
-            self.say("Pick a pixel layer to import onto");
-            return;
-        };
         let ase = match std::fs::read(&path).map_err(|e| e.to_string()).and_then(|b| pixelle_core::aseprite::parse(&b).map_err(|e| e.to_string())) {
             Ok(a) => a,
             Err(e) => return self.say(format!("Could not read {}: {e}", path.display())),
         };
-        let name = path.file_stem().map_or("sprite".into(), |s| pixelle_core::import::snake(&s.to_string_lossy()));
-        let at = self.anchor();
+        self.write_back_all();
+        let base = path.file_stem().map_or("sprite".into(), |s| pixelle_core::import::snake(&s.to_string_lossy()));
         let mut report = pixelle_core::import::Report::default();
-        let mut result = Ok(Vec::new());
-        self.edit("Import Aseprite", None, |p| {
-            result = pixelle_core::import::aseprite(p, &ase, at, layer, &name, false, &mut report);
-        });
-        match result {
-            Ok(names) => self.say(format!("Imported {} frames as {}", ase.frames.len(), names.join(", "))),
+        match pixelle_core::import::aseprite(&mut self.project.palette, &ase, &base, true, &mut report) {
+            Ok(sprites) => {
+                self.broadcast_palette();
+                let mut names = Vec::new();
+                for (name, s) in sprites {
+                    let name = workspace::free_name(&self.project, &name);
+                    if let Err(e) = self.new_file(&name, File::Sprite(s)) {
+                        return self.say(e);
+                    }
+                    names.push(name);
+                }
+                self.say(format!("Imported {}; {} new colours", names.join(", "), report.added.len()));
+            }
             Err(e) => self.say(e),
         }
     }
@@ -574,6 +1229,7 @@ impl Editor {
         self.add_palette_section(&label, &colours);
     }
 
+    /// Add a section at the end of the palette. Nothing moves, so it is an ordinary edit.
     pub fn add_palette_section(&mut self, label: &str, colours: &[(String, [u8; 4])]) {
         if self.doc.project.palette.len() + colours.len() > 256 {
             self.say("That does not fit: a palette holds 256 entries");
@@ -591,20 +1247,22 @@ impl Editor {
         let Some(path) = rfd::FileDialog::new().add_filter("PNG", &["png"]).set_file_name("atlas.png").save_file() else {
             return;
         };
-        let atlas = pack::pack(&self.doc.project, 1);
-        let png = png_io::encode_rgba(&atlas.image().to_rgba(&self.doc.project.palette));
-        match png.map_err(|e| e.to_string()).and_then(|b| std::fs::write(&path, b).map_err(|e| e.to_string())) {
-            Ok(()) => self.say(format!("Exported {}x{} atlas", atlas.width, atlas.height)),
+        self.write_back_all();
+        let baked = bake::bake_folder(&self.project);
+        let img = pixelle_core::render::RgbaImage { w: baked.atlas_width, h: baked.atlas_height, px: baked.atlas_rgba() };
+        match png_io::encode_rgba(&img).map_err(|e| e.to_string()).and_then(|b| std::fs::write(&path, b).map_err(|e| e.to_string())) {
+            Ok(()) => self.say(format!("Exported {}x{} atlas", img.w, img.h)),
             Err(e) => self.say(e),
         }
     }
 
     pub fn export_baked(&mut self) {
-        let name = format!("{}.pxlb", self.doc.project.name);
+        let name = format!("{}.pxlb", self.project.name);
         let Some(path) = rfd::FileDialog::new().add_filter("Baked", &["pxlb"]).set_file_name(name).save_file() else {
             return;
         };
-        let bytes = bake::bake(&self.doc.project).to_bytes();
+        self.write_back_all();
+        let bytes = bake::bake_folder(&self.project).to_bytes();
         match std::fs::write(&path, &bytes) {
             Ok(()) => self.say(format!("Baked {} bytes", bytes.len())),
             Err(e) => self.say(e.to_string()),
@@ -622,12 +1280,15 @@ impl Editor {
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
         egui::Panel::left("tools").default_size(250.0).show(ui, |ui| {
             egui::ScrollArea::vertical().id_salt("left").auto_shrink(false).show(ui, |ui| {
+                egui::CollapsingHeader::new("Files").default_open(true).show(ui, |ui| self.files_panel(ui));
+                ui.separator();
                 self.tools_panel(ui);
                 ui.separator();
                 egui::CollapsingHeader::new("Palette").default_open(true).show(ui, |ui| self.palette_panel(ui));
             });
         });
         egui::Panel::right("side").default_size(320.0).show(ui, |ui| self.side_panel(ui));
+        egui::Panel::top("tabs").show(ui, |ui| self.tabs_bar(ui));
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(egui::Color32::from_gray(38)))
             .show(ui, |ui| self.canvas(ui));
@@ -637,47 +1298,59 @@ impl Editor {
     }
 
     fn housekeeping(&mut self, ctx: &egui::Context) {
+        self.share_project_wide();
         let changes = self.doc.take_changes();
         if !changes.is_empty() {
             self.backend.invalidate(&changes);
         }
         if self.problems.0 != self.doc.revision {
-            self.problems = (self.doc.revision, self.doc.project.validate());
+            self.problems = (self.doc.revision, self.doc_problems());
         }
-        let title = format!(
-            "{}{} — Pixelle",
-            if self.doc.dirty { "• " } else { "" },
-            self.doc.path.as_ref().and_then(|p| p.file_name()).map_or("untitled".into(), |n| n.to_string_lossy().into_owned())
-        );
+        let title = format!("{}{} — Pixelle", if self.any_unsaved() { "• " } else { "" }, self.project.name);
         if title != self.title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.title = title;
         }
         if self.autosave_at.elapsed() > AUTOSAVE_EVERY {
             self.autosave_at = Instant::now();
-            if self.doc.dirty && self.doc.path.is_some() && self.doc.autosave().is_err() {
-                self.say("Autosave failed");
-            }
+            self.autosave();
         }
         if self.watch_at.elapsed() > WATCH_EVERY {
             self.watch_at = Instant::now();
-            if !self.disk_changed && self.doc.changed_on_disk() {
-                if self.doc.dirty {
-                    self.disk_changed = true;
-                } else if self.doc.reload().is_ok() {
-                    self.fix_selection();
-                    self.say("Reloaded: the file changed on disk");
-                }
+            if self.modal.is_none() {
+                self.watch();
             }
         }
-        if ctx.input(|i| i.viewport().close_requested()) && self.doc.dirty && !self.allow_close {
+        if ctx.input(|i| i.viewport().close_requested()) && self.any_unsaved() && !self.allow_close {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.confirm_close = true;
+            self.modal = Some(Modal::Close);
         }
         ctx.request_repaint_after(Duration::from_secs(1));
     }
 
+    /// What is wrong with the open file, as the game would see it.
+    fn doc_problems(&self) -> Vec<String> {
+        let mut p = ProjectDir::new("");
+        p.palette = self.doc.project.palette.clone();
+        p.swaps = self.doc.project.swaps.clone();
+        match self.kind().clone() {
+            TabKind::Sprite(n) => {
+                p.sprites.insert(n, workspace::canvas_sprite(&self.doc.project));
+            }
+            TabKind::Terrain(n) => {
+                if let Some(t) = self.project.terrains.get(&n) {
+                    p.terrains.insert(n, workspace::canvas_terrain(&self.doc.project, t));
+                }
+            }
+            TabKind::Sandbox => {}
+        }
+        p.validate()
+    }
+
     fn shortcuts(&mut self, ctx: &egui::Context) {
+        if self.modal.is_some() {
+            return;
+        }
         let cmd = |k| KeyboardShortcut::new(Modifiers::COMMAND, k);
         let cmd_shift = |k| KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, k);
         let consume = |s: KeyboardShortcut| ctx.input_mut(|i| i.consume_shortcut(&s));
@@ -687,14 +1360,17 @@ impl Editor {
         if consume(cmd(Key::Z)) {
             self.undo();
         }
-        if consume(cmd_shift(Key::S)) {
-            self.save(true);
-        }
         if consume(cmd(Key::S)) {
-            self.save(false);
+            self.save();
         }
         if consume(cmd(Key::O)) {
-            self.open();
+            self.pick_project();
+        }
+        if consume(cmd(Key::N)) {
+            self.ask_new_file();
+        }
+        if consume(cmd(Key::W)) {
+            self.close_tab(self.active);
         }
         if ctx.egui_wants_keyboard_input() {
             return;
@@ -706,18 +1382,16 @@ impl Editor {
             self.copy(true);
         }
         if consume(cmd(Key::V)) {
-            let at = self
-                .selection
-                .map(|s| s.min())
-                .unwrap_or_else(|| IVec2::new(self.view.center.x as i32, self.view.center.y as i32));
+            let at = self.selection.map(|s| s.min()).unwrap_or_else(|| self.anchor());
             self.paste(at);
         }
         if consume(cmd(Key::A))
-            && let Some(b) = self.pixel_layer().and_then(|l| self.doc.grid(l)).and_then(|g| g.bounds()) {
-                self.commit_floating();
-                self.selection = Some(b);
-                self.tool = Tool::Select;
-            }
+            && let Some(b) = self.pixel_layer().and_then(|l| self.doc.grid(l)).and_then(|g| g.bounds())
+        {
+            self.commit_floating();
+            self.selection = Some(b);
+            self.tool = Tool::Select;
+        }
         if consume(cmd(Key::Num0)) {
             self.fit_pending = true;
         }
@@ -756,79 +1430,51 @@ impl Editor {
             let c = self.canvas_rect.center();
             self.view.step_zoom(self.canvas_rect, c, -1);
         }
+        // Step through a sprite's frames.
+        if let Selected::Sprite { name, frame } = self.selected.clone() {
+            let n = self.doc.project.sprite(&name).map_or(1, |s| s.frames.len()) as i32;
+            let step = if pressed(Key::OpenBracket) { -1 } else if pressed(Key::CloseBracket) { 1 } else { 0 };
+            if step != 0 {
+                self.selected = Selected::Sprite { name, frame: (frame as i32 + step).rem_euclid(n) as usize };
+            }
+        }
         let grid = self.doc.project.grid.max(1) as i32;
         for (k, d) in [(Key::ArrowLeft, IVec2::NEG_X), (Key::ArrowRight, IVec2::X), (Key::ArrowUp, IVec2::NEG_Y), (Key::ArrowDown, IVec2::Y)] {
             let step = if shift_pressed(k) { Some(d * grid) } else if pressed(k) { Some(d) } else { None };
-            if let Some(step) = step {
-                match (&self.selected, self.tool) {
-                    (Selected::Instance { layer, index }, Tool::Instance) => {
-                        let (layer, index) = (*layer, *index);
-                        self.edit("Move instance", Some("nudge"), |p| {
-                            if let Some(LayerKind::Instances(list)) = p.layer_mut(layer).map(|l| &mut l.kind)
-                                && let Some(i) = list.get_mut(index)
-                            {
-                                i.pos += step;
-                            }
-                        });
-                    }
-                    _ if self.selection.is_some() => self.nudge(step),
-                    _ => {}
-                }
+            if let Some(step) = step
+                && self.selection.is_some()
+            {
+                self.nudge(step);
             }
         }
-        if self.tool == Tool::Instance
-            && let Selected::Instance { layer, index } = self.selected.clone()
-        {
-            let flip = if pressed(Key::F) {
-                Some(pixelle_core::D4::FLIP_X)
-            } else if shift_pressed(Key::F) {
-                Some(pixelle_core::D4::FLIP_Y)
-            } else {
-                None
-            };
-            let frame_step = if pressed(Key::OpenBracket) { -1 } else if pressed(Key::CloseBracket) { 1 } else { 0 };
-            if flip.is_some() || frame_step != 0 {
-                self.edit("Change instance", None, |p| {
-                    let frames = |name: &str| p.sprite(name).map_or(1, |s| s.frames.len() as i32);
-                    let count = match p.layer(layer).map(|l| &l.kind) {
-                        Some(LayerKind::Instances(list)) => list.get(index).map(|i| frames(&i.sprite)),
-                        _ => None,
-                    };
-                    if let Some(LayerKind::Instances(list)) = p.layer_mut(layer).map(|l| &mut l.kind)
-                        && let Some(i) = list.get_mut(index)
-                    {
-                        if let Some(f) = flip {
-                            i.transform = f.after(i.transform);
-                        }
-                        let n = count.unwrap_or(1);
-                        i.frame = (i.frame as i32 + frame_step).rem_euclid(n) as u32;
-                    }
-                });
-            }
-        }
+    }
+
+    fn anchor(&self) -> IVec2 {
+        IVec2::new(self.view.center.x.floor() as i32, self.view.center.y.floor() as i32)
+    }
+
+    pub fn ask_new_file(&mut self) {
+        let g = self.project.grid.max(1);
+        self.modal = Some(Modal::NewFile { name: String::new(), terrain: false, w: g * 2, h: g * 2, cell: g, error: None });
     }
 
     fn menu(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
-                ui.menu_button("New", |ui| {
-                    for preset in presets::ALL {
-                        if ui.button(format!("With {}", preset.0)).clicked() {
-                            self.new_file(preset);
-                        }
-                    }
-                });
-                if ui.button("Open…  ⌘O").clicked() {
-                    self.open();
+                if ui.button("Open or start a project folder…  ⌘O").clicked() {
+                    self.pick_project();
                 }
-                if ui.button("Save  ⌘S").clicked() {
-                    self.save(false);
+                if ui.button("New file…  ⌘N").clicked() {
+                    self.ask_new_file();
                 }
-                if ui.button("Save as…  ⇧⌘S").clicked() {
-                    self.save(true);
+                if ui.button("Save  ⌘S").on_hover_text("Writes every file that changed").clicked() {
+                    self.save();
+                }
+                if ui.add_enabled(self.kind() != &TabKind::Sandbox, egui::Button::new("Close tab  ⌘W")).clicked() {
+                    self.close_tab(self.active);
                 }
                 ui.separator();
-                if ui.button("Import PNG onto layer…").clicked() {
+                if ui.button("Import PNG as a sprite…").clicked() {
                     self.import_png();
                 }
                 if ui.button("Import Aseprite…").clicked() {
@@ -841,7 +1487,7 @@ impl Editor {
                 if ui.button("Export atlas PNG…").clicked() {
                     self.export_atlas();
                 }
-                if ui.button("Bake runtime file (.pxlb)…").clicked() {
+                if ui.button("Bake web file (.pxlb)…").clicked() {
                     self.export_baked();
                 }
                 ui.separator();
@@ -850,7 +1496,8 @@ impl Editor {
                 }
             });
             ui.menu_button("Edit", |ui| {
-                let undo = self.doc.can_undo().map(|l| format!("Undo {l}  ⌘Z"));
+                let undo = self.doc.can_undo().map(str::to_string).or_else(|| self.can_undo_palette().map(str::to_string));
+                let undo = undo.map(|l| format!("Undo {l}  ⌘Z"));
                 if ui.add_enabled(undo.is_some(), egui::Button::new(undo.unwrap_or("Undo".into()))).clicked() {
                     self.undo();
                 }
@@ -880,29 +1527,59 @@ impl Editor {
             ui.menu_button("View", |ui| {
                 ui.checkbox(&mut self.opts.pixel_grid, "Pixel grid");
                 ui.checkbox(&mut self.opts.tile_grid, "Tile grid");
-                ui.checkbox(&mut self.opts.sprite_boxes, "Sprite boxes");
+                ui.checkbox(&mut self.opts.sprite_boxes, "Frame boxes");
                 ui.checkbox(&mut self.opts.previews, "Animation previews");
                 ui.checkbox(&mut self.opts.minimap, "Minimap");
                 ui.separator();
                 if ui.button("Fit everything  ⌘0").clicked() {
                     self.fit_pending = true;
                 }
-                ui.menu_button("Go to", |ui| {
-                    let marks = self.doc.project.bookmarks.clone();
-                    for b in marks {
-                        if ui.button(&b.name).clicked() {
-                            self.view.fit(self.canvas_rect, b.rect);
-                        }
-                    }
-                });
             });
             ui.menu_button("Help", |ui| {
                 ui.label("Tools: B pencil · E eraser · L line · R rect · G fill · I picker");
-                ui.label("M select · T terrain · S sprite · N instance · H hand");
-                ui.label("X swap colours · Space/middle drag pans · ⌘/pinch scroll zooms");
+                ui.label("M select · T terrain · S frames · H hand");
+                ui.label("X swap colours · [ ] previous/next frame");
+                ui.label("Space/middle drag pans · ⌘/pinch scroll zooms");
                 ui.label("+/- zoom · ⌘0 fit · Esc deselect · Enter commit");
+                ui.label("⌘S saves every changed file · ⌘N new file · ⌘W close tab");
             });
         });
+    }
+
+    fn tabs_bar(&mut self, ui: &mut egui::Ui) {
+        let mut activate = None;
+        let mut close = None;
+        ui.horizontal(|ui| {
+            for (i, t) in self.tabs.iter().enumerate() {
+                let dirty = t.kind.asset().is_some_and(|_| if i == self.active { self.doc.dirty } else { t.state.as_ref().is_some_and(|s| s.doc.dirty) });
+                let icon = match t.kind {
+                    TabKind::Sandbox => "✳",
+                    TabKind::Sprite(_) => "🖼",
+                    TabKind::Terrain(_) => "▦",
+                };
+                let label = format!("{icon} {}{}", t.kind.label(), if dirty { " •" } else { "" });
+                let r = ui.selectable_label(i == self.active, label);
+                let r = match t.kind.asset() {
+                    Some(a) => r.on_hover_text(a),
+                    None => r.on_hover_text("Try the project's terrains here. Nothing in it is saved."),
+                };
+                if r.clicked() {
+                    activate = Some(i);
+                }
+                if r.middle_clicked() {
+                    close = Some(i);
+                }
+                if t.kind != TabKind::Sandbox && ui.small_button("×").on_hover_text("Close").clicked() {
+                    close = Some(i);
+                }
+                ui.add_space(6.0);
+            }
+        });
+        if let Some(i) = close {
+            self.close_tab(i);
+        } else if let Some(i) = activate {
+            self.activate(i);
+        }
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
@@ -934,71 +1611,188 @@ impl Editor {
     }
 
     fn modals(&mut self, ctx: &egui::Context) {
-        if let Some(auto) = self.recover.clone() {
-            egui::Modal::new(egui::Id::new("recover")).show(ctx, |ui| {
-                ui.heading("Recover unsaved changes?");
-                ui.label("An autosave newer than this file was found. It holds changes that were never saved.");
+        let Some(modal) = self.modal.take() else { return };
+        let mut keep = true;
+        let mut then: Option<Box<dyn FnOnce(&mut Editor)>> = None;
+        let mut modal = modal;
+        egui::Modal::new(egui::Id::new("modal")).show(ctx, |ui| match &mut modal {
+            Modal::NewFile { name, terrain, w, h, cell, error } => {
+                ui.heading("New file");
+                let r = ui.add(egui::TextEdit::singleline(name).hint_text("name, e.g. weapons/shotgun").desired_width(260.0));
+                if r.gained_focus() || name.is_empty() {
+                    r.request_focus();
+                }
+                ui.horizontal(|ui| {
+                    ui.radio_value(terrain, false, "Sprite");
+                    ui.radio_value(terrain, true, "Terrain");
+                });
+                if *terrain {
+                    ui.label(Preset::TwoSurface { mirror: false }.label());
+                    ui.label(egui::RichText::new("Ground against air, every way a tile faces drawn on its own: lit tops, shaded bottoms.").small().weak());
+                    ui.horizontal(|ui| {
+                        ui.label("Cell");
+                        ui.add(egui::DragValue::new(cell).range(2..=128).suffix(" px"));
+                    });
+                    ui.add_enabled(false, egui::Checkbox::new(&mut false, "Mirror (fewer tiles, no shading) — coming later"));
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label("Size");
+                        ui.add(egui::DragValue::new(w).range(1..=1024));
+                        ui.label("×");
+                        ui.add(egui::DragValue::new(h).range(1..=1024));
+                    });
+                }
+                if let Some(e) = error {
+                    ui.colored_label(egui::Color32::from_rgb(240, 120, 100), e.as_str());
+                }
+                ui.horizontal(|ui| {
+                    let enter = ui.input(|i| i.key_pressed(Key::Enter));
+                    if ui.button("Create").clicked() || enter {
+                        let file = if *terrain {
+                            let c = (*cell).max(2) & !1;
+                            File::Terrain(TerrainFile::new(Preset::TwoSurface { mirror: false }, c))
+                        } else {
+                            File::Sprite(SpriteFile::new(*w, *h))
+                        };
+                        let n = name.trim().to_string();
+                        let cell_odd = *terrain && *cell % 2 == 1;
+                        then = Some(Box::new(move |ed: &mut Editor| {
+                            if let Err(e) = ed.new_file(&n, file) {
+                                ed.modal = Some(Modal::NewFile { name: n, terrain: false, w: 16, h: 16, cell: 8, error: Some(e) });
+                            } else if cell_odd {
+                                ed.say("Cells are split in quarters, so the size was made even");
+                            }
+                        }));
+                        keep = false;
+                    }
+                    if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                        keep = false;
+                    }
+                });
+            }
+            Modal::Rename { from, to, error } => {
+                ui.heading(format!("Rename {from}"));
+                let r = ui.add(egui::TextEdit::singleline(to).desired_width(260.0));
+                r.request_focus();
+                if let Some(e) = error {
+                    ui.colored_label(egui::Color32::from_rgb(240, 120, 100), e.as_str());
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Rename").clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
+                        let (f, t) = (from.clone(), to.trim().to_string());
+                        then = Some(Box::new(move |ed: &mut Editor| {
+                            if let Err(e) = ed.rename(&f, &t) {
+                                ed.modal = Some(Modal::Rename { from: f, to: t, error: Some(e) });
+                            }
+                        }));
+                        keep = false;
+                    }
+                    if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                        keep = false;
+                    }
+                });
+            }
+            Modal::Delete(name) => {
+                ui.heading(format!("Delete {name}?"));
+                ui.label("Its file goes when you next save.");
+                ui.horizontal(|ui| {
+                    if ui.button("Delete").clicked() {
+                        let n = name.clone();
+                        then = Some(Box::new(move |ed: &mut Editor| ed.delete(&n)));
+                        keep = false;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        keep = false;
+                    }
+                });
+            }
+            Modal::Recover(files) => {
+                ui.heading("Recover unsaved work?");
+                ui.label("These were changed and never saved:");
+                for rel in files.keys() {
+                    ui.label(format!("  {rel}"));
+                }
                 ui.horizontal(|ui| {
                     if ui.button("Recover").clicked() {
-                        match pixelle_core::format::load_file(&auto) {
-                            Ok(p) => {
-                                self.doc.edit("Recover autosave", None, |proj| *proj = p);
-                                self.say("Recovered; save to keep it");
-                            }
-                            Err(e) => self.say(format!("The autosave is unreadable: {e}")),
-                        }
-                        self.recover = None;
+                        let f = std::mem::take(files);
+                        then = Some(Box::new(move |ed: &mut Editor| ed.recover(f)));
+                        keep = false;
                     }
                     if ui.button("Discard it").clicked() {
-                        let _ = std::fs::remove_file(&auto);
-                        self.recover = None;
+                        then = Some(Box::new(|ed: &mut Editor| {
+                            if let Some(d) = &ed.disk {
+                                d.clear_autosave();
+                            }
+                        }));
+                        keep = false;
                     }
                 });
-            });
-        }
-        if self.disk_changed {
-            egui::Modal::new(egui::Id::new("disk")).show(ctx, |ui| {
-                ui.heading("The file changed on disk");
-                ui.label("Something else wrote the project while you had unsaved changes.");
+            }
+            Modal::DiskChanged(files) => {
+                ui.heading("Files changed on disk");
+                ui.label("Something else wrote these while you had unsaved changes to them:");
+                for rel in files.iter() {
+                    ui.label(format!("  {rel}"));
+                }
                 ui.horizontal(|ui| {
                     if ui.button("Load theirs").clicked() {
-                        let _ = self.doc.reload();
-                        self.fix_selection();
-                        self.disk_changed = false;
+                        let f = files.clone();
+                        then = Some(Box::new(move |ed: &mut Editor| {
+                            for rel in &f {
+                                let a = if rel == folder::ROOT { "project".to_string() } else { folder::asset_name(rel) };
+                                ed.unsaved.remove(&a);
+                                if let Some(i) = ed.tabs.iter().position(|t| t.kind.asset() == Some(&a)) {
+                                    ed.tab_doc_mut(i).dirty = false;
+                                }
+                            }
+                            ed.load_from_disk(&f);
+                        }));
+                        keep = false;
                     }
                     if ui.button("Keep mine").clicked() {
-                        self.doc.disk_mtime = self
-                            .doc
-                            .path
-                            .as_ref()
-                            .and_then(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
-                        self.disk_changed = false;
+                        let f = files.clone();
+                        then = Some(Box::new(move |ed: &mut Editor| {
+                            if let Some(d) = &mut ed.disk {
+                                for rel in &f {
+                                    d.note(rel);
+                                }
+                            }
+                        }));
+                        keep = false;
                     }
                 });
-            });
-        }
-        if self.confirm_close {
-            egui::Modal::new(egui::Id::new("close")).show(ctx, |ui| {
+            }
+            Modal::Close => {
                 ui.heading("Save changes before closing?");
                 ui.horizontal(|ui| {
                     if ui.button("Save").clicked() {
-                        self.save(false);
-                        if !self.doc.dirty {
-                            self.allow_close = true;
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                        self.confirm_close = false;
+                        then = Some(Box::new(|ed: &mut Editor| {
+                            ed.save();
+                            if !ed.any_unsaved() {
+                                ed.allow_close = true;
+                            }
+                        }));
+                        keep = false;
                     }
                     if ui.button("Don't save").clicked() {
-                        self.allow_close = true;
-                        self.confirm_close = false;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        then = Some(Box::new(|ed: &mut Editor| ed.allow_close = true));
+                        keep = false;
                     }
                     if ui.button("Cancel").clicked() {
-                        self.confirm_close = false;
+                        keep = false;
                     }
                 });
-            });
+            }
+        });
+        let closing = matches!(modal, Modal::Close);
+        if keep {
+            self.modal = Some(modal);
+        }
+        if let Some(f) = then {
+            f(self);
+        }
+        if closing && self.allow_close {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 
@@ -1033,11 +1827,20 @@ impl Editor {
     }
 }
 
-pub fn new_project(preset: presets::Preset) -> Project {
-    let mut p = Project::new("untitled");
-    let _ = presets::add(&mut p.palette, preset);
-    p.add_layer("Art", LayerKind::Pixels(Default::default()));
-    p
+/// The assets whose pixels differ between two versions of a project.
+fn changed_assets(before: &ProjectDir, after: &ProjectDir) -> Vec<String> {
+    let mut out = Vec::new();
+    for (n, s) in &after.sprites {
+        if before.sprites.get(n) != Some(s) {
+            out.push(n.clone());
+        }
+    }
+    for (n, t) in &after.terrains {
+        if before.terrains.get(n) != Some(t) {
+            out.push(n.clone());
+        }
+    }
+    out
 }
 
 impl eframe::App for Editor {

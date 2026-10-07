@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 serde.workspace = true
 postcard.workspace = true
+ron.workspace = true
 miniz_oxide.workspace = true
 glam.workspace = true
 png = { workspace = true, optional = true }

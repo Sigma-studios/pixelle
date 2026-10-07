@@ -171,8 +171,13 @@ impl Project {
 
     /// Everything drawn on the canvas, instances and terrain included.
     pub fn bounds(&self) -> IRect {
+        self.bounds_where(|_| true)
+    }
+
+    /// Everything drawn on the layers `keep` accepts.
+    pub fn bounds_where(&self, keep: impl Fn(&Layer) -> bool) -> IRect {
         let mut out = IRect::default();
-        for layer in &self.layers {
+        for layer in self.layers.iter().filter(|l| keep(l)) {
             let r = match &layer.kind {
                 LayerKind::Pixels(grid) => grid.bounds(),
                 LayerKind::Terrain(t) => t.cells.bounds().map(|b| {

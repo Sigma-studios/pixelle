@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use eframe::egui::{self, Color32, ColorImage, Painter, Rect, TextureHandle, TextureId, TextureOptions, pos2};
 use pixelle_core::render::{Indexed, Renderer, RgbaImage};
-use pixelle_core::{D4, IRect, Project};
+use pixelle_core::{IRect, Project};
 
 use crate::doc::Changes;
 use crate::view::View;
@@ -29,9 +29,6 @@ pub trait CanvasBackend {
     /// A texture of an arbitrary indexed picture, for overlays such as a floating selection.
     /// `key` identifies the picture: the same key is not re-uploaded.
     fn overlay(&mut self, ctx: &egui::Context, key: u64, image: &Indexed, project: &Project) -> TextureId;
-
-    /// One tile of a tileset in an orientation.
-    fn tile(&mut self, ctx: &egui::Context, project: &Project, tileset: &str, index: u32, t: D4) -> Option<TextureId>;
 
     /// A small picture of everything in `bounds`, at most `max` pixels on a side.
     fn thumbnail(&mut self, ctx: &egui::Context, project: &Project, revision: u64, bounds: IRect, max: u32) -> Option<TextureId>;
@@ -52,7 +49,6 @@ pub struct CpuTiles {
     /// `(sprite, frame)` → the frame's texture and size, `None` if it is empty.
     frames: HashMap<(String, usize), Option<Sized>>,
     overlays: HashMap<u64, TextureHandle>,
-    tile_pics: HashMap<(String, u32, D4), TextureHandle>,
     thumb: Option<(u64, IRect, TextureHandle)>,
 }
 
@@ -67,7 +63,6 @@ impl CanvasBackend for CpuTiles {
             self.tiles.clear();
             self.frames.clear();
             self.overlays.clear();
-            self.tile_pics.clear();
             return;
         }
         for r in &changes.rects {
@@ -81,7 +76,6 @@ impl CanvasBackend for CpuTiles {
         }
         if !changes.rects.is_empty() {
             self.frames.clear();
-            self.tile_pics.clear();
         }
     }
 
@@ -152,22 +146,6 @@ impl CanvasBackend for CpuTiles {
             .entry(key)
             .or_insert_with(|| upload(ctx, "overlay", &image.to_rgba(&project.palette)))
             .id()
-    }
-
-    fn tile(&mut self, ctx: &egui::Context, project: &Project, tileset: &str, index: u32, t: D4) -> Option<TextureId> {
-        let key = (tileset.to_string(), index, t);
-        if let Some(tex) = self.tile_pics.get(&key) {
-            return Some(tex.id());
-        }
-        let ts = project.tileset(tileset)?;
-        if index >= ts.count {
-            return None;
-        }
-        let pic = Renderer::new(project).indexed(ts.tile_rect(index), &ts.layers).transformed(t);
-        let tex = upload(ctx, "tile", &pic.to_rgba(&project.palette));
-        let id = tex.id();
-        self.tile_pics.insert(key, tex);
-        Some(id)
     }
 
     fn thumbnail(&mut self, ctx: &egui::Context, project: &Project, revision: u64, bounds: IRect, max: u32) -> Option<TextureId> {

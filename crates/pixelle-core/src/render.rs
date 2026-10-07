@@ -387,6 +387,7 @@ mod tests {
             columns: 1,
             count: 1,
             layers: vec![art],
+            gap: 0,
         });
         p.terrains.push(Terrain {
             name: "t".into(),

@@ -1,6 +1,6 @@
 [package]
 name = "showcase"
-description = "run-2d's art, loaded from one Pixelle file, in a Bevy app"
+description = "run-2d's art, loaded from a Pixelle project folder, in a Bevy app"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

@@ -15,12 +15,11 @@ pub enum Tool {
     Select,
     Terrain,
     Sprite,
-    Instance,
     Hand,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 11] = [
+    pub const ALL: [Tool; 10] = [
         Tool::Pencil,
         Tool::Eraser,
         Tool::Line,
@@ -30,7 +29,6 @@ impl Tool {
         Tool::Select,
         Tool::Terrain,
         Tool::Sprite,
-        Tool::Instance,
         Tool::Hand,
     ];
 
@@ -44,8 +42,7 @@ impl Tool {
             Tool::Picker => "Picker",
             Tool::Select => "Select",
             Tool::Terrain => "Terrain",
-            Tool::Sprite => "Sprite",
-            Tool::Instance => "Instance",
+            Tool::Sprite => "Frames",
             Tool::Hand => "Hand",
         }
     }
@@ -61,7 +58,6 @@ impl Tool {
             Tool::Select => "M",
             Tool::Terrain => "T",
             Tool::Sprite => "S",
-            Tool::Instance => "N",
             Tool::Hand => "H",
         }
     }
@@ -76,8 +72,7 @@ impl Tool {
             Tool::Picker => "Left: primary · Right: secondary",
             Tool::Select => "Drag to select · drag inside to move · ⌘C/⌘X/⌘V · arrows nudge · Enter commits",
             Tool::Terrain => "Paint the active terrain on a terrain layer · Right: erase",
-            Tool::Sprite => "Click a frame to select · drag to make a sprite · drag its corner to resize · Alt: off-grid",
-            Tool::Instance => "Click to select · drag to move · click empty to place the selected sprite · F flips · [ ] frame",
+            Tool::Sprite => "Click a frame to select it · drag its corner to resize · Alt: off-grid",
             Tool::Hand => "Drag to pan (Space or the middle button pan with any tool)",
         }
     }

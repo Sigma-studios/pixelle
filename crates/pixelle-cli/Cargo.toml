@@ -1,6 +1,6 @@
 [package]
 name = "pixelle-cli"
-description = "Inspect, render and pack Pixelle projects from the command line"
+description = "Inspect, bake and import into Pixelle projects from the command line"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

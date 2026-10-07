@@ -1,57 +1,41 @@
-//! Generate `run2d.pxl`: every piece of run-2d's art on one canvas.
+//! Turn run-2d's art into a Pixelle project folder.
 //!
 //! ```text
-//! cargo run -p run2d-import -- /path/to/run-2d [-o run2d.pxl]
+//! cargo run -p run2d-import -- /path/to/run-2d -o /path/to/run-2d/assets/art
+//! cargo run -p run2d-import -- /path/to/run-2d -o examples/showcase/assets/run2d --showcase
 //! ```
 //!
 //! What goes in:
-//! - the six sheets, from their PNGs (what the game draws today), with any hidden `.aseprite`
-//!   layers kept beside them as sketches, and the unexported `walls2.aseprite` as work in progress;
-//! - every colour the game's code names, as labelled palette sections;
-//! - the art the game draws in code — the bullet, the blast, the tinted flag pads, the net, the
-//!   transposed wall frames, the editor's cursors — as pixels an artist can now paint over;
-//! - names for every frame, the anchor pixels the code seats weapons by, and the recolour slots;
-//! - the wall and platform autotiling as terrains, and a showcase level built from all of it.
+//! - a sprite per sheet, frames in sheet order so the game's frame indices still hold, with any
+//!   hidden `.aseprite` layers kept as layers of their own that are not exported, and the
+//!   unexported `walls2.aseprite` as work in progress;
+//! - the walls as a terrain, "2D grid, two surfaces" with the mirror off: every way a tile faces is
+//!   drawn out, starting from the seven frames `cladding.rs` turns to fit;
+//! - every colour the game's code names, as labelled palette sections.
 //!
-//! It is deterministic and re-runnable: until the game reads the file, regenerate it whenever the
-//! sheets change. Before writing, it checks that every sheet comes back out of the file pixel for
-//! pixel, and that the wall terrain reproduces the sheet `cladding.rs` derives at run time.
+//! With `--showcase`, also what the showcase demonstrates and run-2d does not read from art yet:
+//! the pixels the code seats weapons by, the ragdoll and face cuts, the recolour slots, and the
+//! bullet and blast the game draws in code.
+//!
+//! Before writing, it checks that every sheet comes back out of the project pixel for pixel, and
+//! that the walls terrain draws every neighbourhood exactly as `cladding.rs` does.
 
 mod colors;
 
-use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use pixelle_core::aseprite;
-use pixelle_core::layer::{Instance, LayerKind, TerrainLayer};
-use pixelle_core::render::{Renderer, RgbaImage};
-use pixelle_core::tiles::presets::{self, MinimalD4};
-use pixelle_core::{
-    Bookmark, D4, Frame, Grid, IRect, IVec2, LayerId, Project, Sprite, SwapSlot, Terrain, Tileset,
-    format, png_io,
-};
+use pixelle_core::bake;
+use pixelle_core::folder::{Preset, ProjectDir, SpriteFile, SpriteFrame, SpriteLayer, TerrainFile};
+use pixelle_core::render::{Indexed, RgbaImage};
+use pixelle_core::tiles::presets;
+use pixelle_core::{IRect, IVec2, SwapSlot, png_io};
 
 use colors::*;
 
 /// Every frame in run-2d is this big (`atlas::FRAME`), and so is a level cell (`arena::CELL`).
-const TILE: i32 = 8;
-/// Sheets start this far right, leaving room for an animation's preview to play beside it.
-const LEFT: i32 = 16;
-const PLAYER_Y: i32 = 0;
-const WEAPONS_Y: i32 = 16;
-const PROPS_Y: i32 = 32;
-const EMOTES_Y: i32 = 48;
-const WALLS_Y: i32 = 64;
-const PLATFORMS_Y: i32 = 80;
-const BULLET_Y: i32 = 96;
-const FX_Y: i32 = 112;
-/// The blast's frames: wide enough for its widest, 18px radius, with room for its preview.
-const BLAST: u32 = 37;
-const BLAST_X: i32 = 56;
-const BLAST_STRIDE: i32 = 40;
-/// The top of the showcase level.
-const MOCK_Y: i32 = 176;
+const TILE: u32 = 8;
 
 /// `main.rs:164`.
 const TICK: f32 = 1.0 / 64.0;
@@ -69,15 +53,34 @@ const POSES: [&str; 10] = [
     "crouch",
     "crouch_walk",
 ];
-const IDLE: u32 = 0;
-const RUN_1: u32 = 1;
-const SLIDE: u32 = 3;
-const JUMP: u32 = 4;
-const JUMP_ARMED: u32 = 5;
-const WALL_SLIDE_ARMED: u32 = 7;
-const CROUCH: u32 = 8;
 
-/// `weapon.rs:827` `hand_pixel`: where each pose holds a weapon.
+/// `weapon.rs:632-674`, in sheet order: name, whether it is held (seated by `trigger`), whether it
+/// shoots (has a `muzzle`), and `weapon.rs` `ART_OFFSET` (y up) for when it lies loose.
+const WEAPONS: [(&str, bool, bool, [i32; 2]); 16] = [
+    ("shotgun", true, true, [0, 0]),
+    ("handgun", true, true, [0, 0]),
+    ("grenade_launcher", true, true, [1, 0]),
+    ("shell_1", false, false, [0, 0]),
+    ("shell_2", false, false, [0, 0]),
+    ("grenade_capped", true, false, [1, 0]),
+    ("grenade_pulled", true, false, [1, 0]),
+    ("rocket_launcher", true, true, [0, 0]),
+    ("rocket_1", false, false, [0, 0]),
+    ("rocket_2", false, false, [0, 0]),
+    ("sword", true, false, [1, 1]),
+    ("net_gun", true, true, [0, 0]),
+    ("net", false, false, [0, 0]),
+    ("flag_red", true, false, [2, 1]),
+    ("flag_blue", true, false, [2, 1]),
+    ("crate", false, false, [0, 0]),
+];
+
+/// `props.rs:61-68` and `portal.rs:43-45`.
+const PROPS: [&str; 7] = ["weapon_mark", "jump_pad_rest", "jump_pad_sprung", "spikes", "portal_single", "portal_end", "portal_middle"];
+/// `cladding.rs`: the caps and the middle a run of platform is drawn from.
+const PLATFORMS: [&str; 3] = ["cap_left", "middle", "cap_right"];
+
+/// `weapon.rs` `hand_pixel`: where each pose holds a weapon.
 fn hand_pixel(pose: usize) -> IVec2 {
     match POSES[pose] {
         "slide" => IVec2::new(5, 6),
@@ -103,183 +106,97 @@ const RAGDOLL_CUTS: [(&str, [i32; 4]); 6] = [
 /// `weapon.rs:507-509`.
 const TRIGGER: IVec2 = IVec2::new(4, 4);
 const MUZZLE: IVec2 = IVec2::new(6, 3);
-/// `player.rs:55`: seconds between the frames of the run and crouch-walk cycles.
-const RUN_FRAME_TIME: f32 = 0.11;
-/// `weapon.rs:349-351`: a shell (and a rocket) shows its first frame this many ticks, then its
-/// second for the other.
-const SHELL_RING_TICKS: f32 = 8.0;
-const SHELL_CORE_TICKS: f32 = 4.0;
 /// `weapon.rs:457-458`.
 const EXPLOSION_TICKS: u32 = 8;
 const EXPLOSION_RADIUS: f32 = 18.0;
+/// The blast's frames: wide enough for its widest, 18px radius.
+const BLAST: u32 = 37;
 
-/// `weapons.png`, in sheet order: name, whether it is held (seated by `trigger`), whether it
-/// shoots (has a `muzzle`), and `weapon.rs:733` `ART_OFFSET` (y up) for when it lies loose.
-const WEAPONS: [(&str, bool, bool, [i32; 2]); 15] = [
-    ("shotgun", true, true, [0, 0]),
-    ("handgun", true, true, [0, 0]),
-    ("grenade_launcher", true, true, [1, 0]),
-    ("shell_1", false, false, [0, 0]),
-    ("shell_2", false, false, [0, 0]),
-    ("grenade_capped", true, false, [1, 0]),
-    ("grenade_pulled", true, false, [1, 0]),
-    ("rocket_launcher", true, true, [0, 0]),
-    ("rocket_1", false, false, [0, 0]),
-    ("rocket_2", false, false, [0, 0]),
-    ("sword", true, false, [1, 1]),
-    ("net_gun", true, true, [0, 0]),
-    ("net", false, false, [0, 0]),
-    ("flag_red", true, false, [2, 1]),
-    ("flag_blue", true, false, [2, 1]),
-];
-
-/// `cladding.rs:182-218`: the drawn wall frames, then the three `derive_wall_sheet` transposes.
-const WALL_FRAMES: [&str; 10] = [
-    "corner",
-    "top",
-    "column_head",
-    "column_body",
-    "interior",
-    "inside",
-    "double_inside",
-    "left",
-    "bar_end",
-    "bar_body",
-];
-
-/// The showcase: `#` earth, `=` steel girder, 40 cells by 16, from the top-left of the level.
-const LEVEL: [&str; 16] = [
-    "........................................",
-    "........................................",
-    "....====..........................====..",
-    "........................................",
-    "......=....................#............",
-    "..........#####............#............",
-    "...........................#.....###....",
-    "...............====..............###....",
-    "#...............................=====..#",
-    "#......................................#",
-    "#.....##.......................#......##",
-    "#.....##.........===...........#....####",
-    "#.....##.......................#....####",
-    "########################################",
-    "########################################",
-    "########################################",
-];
-
-struct Layers {
-    sky: LayerId,
-    art: LayerId,
-    net: LayerId,
-    sketch: LayerId,
-    wip: LayerId,
-    level: LayerId,
-    props: LayerId,
-    actors: LayerId,
-}
+/// `cladding.rs` `mod wall`: the drawn wall frames, in sheet order, as [`presets::minimal_d4`]
+/// roles — corner, top, column head (strip end), column body (strip), interior, inside, double
+/// inside — which is the order `two_surface` expects them in.
+const WALL_FRAMES: usize = 7;
 
 struct Import {
     root: PathBuf,
-    p: Project,
-    l: Layers,
-    /// Each sheet's own pixels as the game sees them, for the round-trip check.
-    sheets: Vec<(String, IVec2, RgbaImage)>,
+    p: ProjectDir,
+    /// Each sheet as the game sees it, for the round-trip check.
+    sheets: Vec<(String, RgbaImage)>,
     notes: Vec<String>,
 }
 
 fn main() -> Result<()> {
+    let usage = "usage: run2d-import <run-2d checkout> -o <project folder> [--showcase]";
     let mut args = std::env::args().skip(1);
     let mut root = None;
-    let mut out = PathBuf::from("run2d.pxl");
+    let mut out = None;
+    let mut showcase = false;
     while let Some(a) = args.next() {
         match a.as_str() {
-            "-o" | "--out" => out = args.next().context("-o needs a path")?.into(),
+            "-o" | "--out" => out = Some(PathBuf::from(args.next().context("-o needs a folder")?)),
+            "--showcase" => showcase = true,
             "-h" | "--help" => {
-                println!("usage: run2d-import <run-2d checkout> [-o run2d.pxl]");
+                println!("{usage}");
                 return Ok(());
             }
             _ => root = Some(PathBuf::from(a)),
         }
     }
-    let root = root.context("usage: run2d-import <run-2d checkout> [-o run2d.pxl]")?;
-    ensure!(
-        root.join("assets/images/player.png").exists(),
-        "{} does not look like a run-2d checkout",
-        root.display()
-    );
+    let (root, out) = (root.context(usage)?, out.context(usage)?);
+    ensure!(root.join("assets/images/player.png").exists(), "{} does not look like a run-2d checkout with its sheets", root.display());
 
-    let mut import = Import::new(root)?;
+    let mut import = Import { root, p: ProjectDir::new("run-2d"), sheets: Vec::new(), notes: Vec::new() };
+    import.p.grid = TILE;
+    import.palette()?;
     import.sheets()?;
-    import.code_art()?;
-    import.sprites()?;
-    import.terrains();
-    import.level()?;
+    if showcase {
+        import.showcase()?;
+    }
     import.p.palette.drop_empty_sections();
     import.verify()?;
     import.colours_in_code()?;
 
     let problems = import.p.validate();
     ensure!(problems.is_empty(), "the generated project has problems:\n{}", problems.join("\n"));
-    format::save_file(&import.p, &out)?;
+    clear_stale(&out, &import.p)?;
+    let written = import.p.save(&out)?;
 
     for note in &import.notes {
         println!("note: {note}");
     }
-    let bytes = std::fs::metadata(&out)?.len();
     println!(
-        "wrote {} ({bytes} bytes): {} palette entries in {} sections, {} layers, {} sprites, {} terrains",
+        "{}: wrote {} files; {} palette entries in {} sections, {} sprites, {} terrains",
         out.display(),
+        written.len(),
         import.p.palette.len(),
         import.p.palette.sections().len(),
-        import.p.layers.len(),
         import.p.sprites.len(),
         import.p.terrains.len()
     );
     Ok(())
 }
 
-fn strip(y: i32, i: i32) -> IRect {
-    IRect::new(LEFT + i * TILE, y, TILE as u32, TILE as u32)
+/// Remove `.pxl` files a previous run wrote that this one does not, so the folder is exactly the
+/// project.
+fn clear_stale(out: &Path, p: &ProjectDir) -> Result<()> {
+    let keep: std::collections::BTreeSet<PathBuf> = p.to_files().keys().map(|k| out.join(k)).collect();
+    let mut dirs = vec![out.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries {
+            let path = entry?.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|e| e == "pxl") && !keep.contains(&path) {
+                std::fs::remove_file(&path)?;
+                println!("removed {}", path.display());
+            }
+        }
+    }
+    Ok(())
 }
 
 impl Import {
-    fn new(root: PathBuf) -> Result<Self> {
-        let mut p = Project::new("run-2d");
-        p.grid = TILE as u32;
-        let px = || LayerKind::Pixels(Grid::new());
-        let l = Layers {
-            sky: p.add_layer("Sky", px()),
-            art: p.add_layer("Art", px()),
-            net: p.add_layer("Net", px()),
-            sketch: p.add_layer("Sketch", px()),
-            wip: p.add_layer("WIP", px()),
-            level: p.add_layer(
-                "Level",
-                LayerKind::Terrain(TerrainLayer {
-                    cell_size: TILE as u32,
-                    cells: Grid::new(),
-                }),
-            ),
-            props: p.add_layer("Props", LayerKind::Instances(Vec::new())),
-            actors: p.add_layer("Actors", LayerKind::Instances(Vec::new())),
-        };
-        // Everything but the art and the net is for looking at, not for export.
-        for id in [l.sky, l.sketch, l.wip, l.level, l.props, l.actors] {
-            p.layer_mut(id).unwrap().reference = true;
-        }
-        p.layer_mut(l.sketch).unwrap().visible = false;
-
-        let mut import = Import {
-            root,
-            p,
-            l,
-            sheets: Vec::new(),
-            notes: Vec::new(),
-        };
-        import.palette()?;
-        Ok(import)
-    }
-
     fn palette(&mut self) -> Result<()> {
         let maps = self.map_backgrounds()?;
         let pal = &mut self.p.palette;
@@ -378,727 +295,260 @@ impl Import {
         Ok(pal.push(name, rgba)?)
     }
 
-    fn paint(&mut self, layer: LayerId, at: IVec2, img: &RgbaImage, sections: &[&str], what: &str) -> Result<()> {
-        for y in 0..img.h {
-            for x in 0..img.w {
-                let i = ((y * img.w + x) * 4) as usize;
-                let c: [u8; 4] = img.px[i..i + 4].try_into()?;
-                let v = self.index(c, sections, what)?;
-                if v != 0 {
-                    self.grid(layer).set(at + IVec2::new(x as i32, y as i32), v);
-                }
-            }
+    fn indexed(&mut self, img: &RgbaImage, sections: &[&str], what: &str) -> Result<Indexed> {
+        let mut out = Indexed::new(img.w, img.h);
+        for (i, c) in img.px.chunks_exact(4).enumerate() {
+            out.px[i] = self.index([c[0], c[1], c[2], c[3]], sections, what)?;
         }
-        Ok(())
+        Ok(out)
     }
 
-    fn grid(&mut self, layer: LayerId) -> &mut Grid {
-        self.p.layer_mut(layer).and_then(|l| l.pixels_mut()).expect("a pixel layer")
+    fn named(&self, section: &str, name: &str) -> u8 {
+        self.p.palette.named(section, name).unwrap_or_else(|| panic!("no {name:?} in {section:?}"))
     }
 
     fn sheets(&mut self) -> Result<()> {
-        self.sheet("player", PLAYER_Y, 10, &["Player keys"])?;
-        self.sheet("weapons", WEAPONS_Y, 15, &[])?;
-        self.sheet("props", PROPS_Y, 4, &[])?;
-        self.sheet("emotes", EMOTES_Y, 4, &[])?;
-        self.sheet("walls", WALLS_Y, 7, &[])?;
-        self.sheet("platforms", PLATFORMS_Y, 3, &[])?;
+        self.sheet("player", &["Player keys"], &POSES)?;
+        self.sheet("weapons", &[], &WEAPONS.map(|w| w.0))?;
+        self.sheet("props", &[], &PROPS)?;
+        self.sheet("emotes", &[], &[])?;
+        self.sheet("platforms", &[], &PLATFORMS)?;
+        self.walls()?;
 
         // Drawn, never exported: kept where it can be finished.
         let path = self.root.join("assets/images/walls2.aseprite");
         if path.exists() {
             let ase = aseprite::parse(&std::fs::read(&path)?)?;
+            let mut s = SpriteFile::new(ase.width, ase.height);
+            s.frames.clear();
             for f in 0..ase.frames.len() {
-                let img = rgba(&ase.visible(f), ase.width, ase.height);
-                let at = IVec2::new(LEFT + (8 + f as i32) * TILE + 8, WALLS_Y);
-                self.paint(self.l.wip, at, &img, &[], "walls2")?;
+                let pic = self.indexed(&rgba(&ase.visible(f), ase.width, ase.height), &[], "walls2")?;
+                let mut frame = SpriteFrame::new(ase.width, ase.height);
+                frame.set_layer("art", pic);
+                s.frames.push(frame);
             }
-            self.notes.push(format!(
-                "walls2.aseprite has no PNG and nothing uses it; its {} frames are on the WIP layer",
-                ase.frames.len()
-            ));
+            self.p.sprites.insert("wip/walls2".into(), s);
+            self.notes.push(format!("walls2.aseprite has no PNG and nothing uses it; its {} frames are wip/walls2", ase.frames.len()));
         }
         Ok(())
     }
 
-    /// One sheet: the PNG onto the art layer, hidden `.aseprite` layers onto the sketch layer.
-    fn sheet(&mut self, name: &str, y: i32, frames: u32, sections: &[&str]) -> Result<()> {
-        let png_path = self.root.join(format!("assets/images/{name}.png"));
-        let img = png_io::decode(&std::fs::read(&png_path)?)
-            .with_context(|| format!("decoding {}", png_path.display()))?
-            .to_rgba();
-        ensure!(
-            (img.w, img.h) == (frames * TILE as u32, TILE as u32),
-            "{name}.png is {}x{}, expected {frames} frames of {TILE}px",
-            img.w,
-            img.h
-        );
-        let at = IVec2::new(LEFT, y);
-        self.paint(self.l.art, at, &img, sections, name)?;
-        self.sheets.push((name.to_string(), at, img.clone()));
-
-        let ase_path = self.root.join(format!("assets/images/{name}.aseprite"));
-        if !ase_path.exists() {
-            return Ok(());
-        }
-        let ase = aseprite::parse(&std::fs::read(&ase_path)?)
-            .with_context(|| format!("reading {}", ase_path.display()))?;
-        ensure!(ase.frames.len() == frames as usize, "{name}.aseprite has {} frames", ase.frames.len());
-        let mut stale = Vec::new();
-        for f in 0..ase.frames.len() {
-            let from_ase = rgba(&ase.visible(f), ase.width, ase.height);
-            let from_png = crop(&img, IRect::new(f as i32 * TILE, 0, TILE as u32, TILE as u32));
-            if normalise(&from_ase) != normalise(&from_png) {
-                stale.push(f);
-            }
-            for (l, layer) in ase.layers.iter().enumerate().filter(|(_, l)| !l.visible) {
-                let pic = rgba(&ase.frames[f][l], ase.width, ase.height);
-                let label = format!("{name} {}", layer.name);
-                self.paint(self.l.sketch, at + IVec2::new(f as i32 * TILE, 0), &pic, sections, &label)?;
-            }
-        }
-        if !stale.is_empty() {
-            self.notes.push(format!(
-                "{name}.png differs from {name}.aseprite in frames {stale:?}; the PNG (what the game draws) was used"
-            ));
-        }
-        if !ase.tags.is_empty() {
-            let tags: Vec<String> = ase.tags.iter().map(|(t, a, b)| format!("{t} {a}..={b}")).collect();
-            self.notes.push(format!("{name}.aseprite tags (cross-check with sprite names): {}", tags.join(", ")));
-        }
-        for layer in ase.layers.iter().filter(|l| !l.visible) {
-            self.notes.push(format!(
-                "{name}.aseprite's hidden layer {:?} is on the Sketch layer (hidden)",
-                layer.name
-            ));
-        }
-        Ok(())
+    /// A sheet's PNG, as the game sees it.
+    fn png(&self, name: &str) -> Result<RgbaImage> {
+        let path = self.root.join(format!("assets/images/{name}.png"));
+        let img = png_io::decode(&std::fs::read(&path)?).with_context(|| format!("decoding {}", path.display()))?.to_rgba();
+        ensure!(img.h == TILE && img.w % TILE == 0, "{name}.png is {}x{}, not a row of {TILE}px frames", img.w, img.h);
+        Ok(img)
     }
 
-    fn named(&self, section: &str, name: &str) -> u8 {
-        self.p
-            .palette
-            .named(section, name)
-            .unwrap_or_else(|| panic!("no {name:?} in {section:?}"))
-    }
+    /// One sheet as a sprite: the PNG on `art`, hidden `.aseprite` layers on layers of their own.
+    fn sheet(&mut self, name: &str, sections: &[&str], frame_names: &[&str]) -> Result<()> {
+        let img = self.png(name)?;
+        let count = (img.w / TILE) as usize;
+        let pic = self.indexed(&img, sections, name)?;
+        let mut s = SpriteFile::new(TILE, TILE);
+        s.frames.clear();
+        if !frame_names.is_empty() && frame_names.len() != count {
+            self.notes.push(format!("{name}.png has {count} frames, but {} names are known for it; left unnamed", frame_names.len()));
+        }
+        for f in 0..count {
+            let mut frame = SpriteFrame::new(TILE, TILE);
+            if frame_names.len() == count {
+                frame.name = Some(frame_names[f].to_string());
+            }
+            frame.set_layer("art", pic.crop(f as u32 * TILE, 0, TILE, TILE));
+            s.frames.push(frame);
+        }
+        self.sheets.push((name.to_string(), img.clone()));
 
-    /// Everything the game draws in code, as pixels.
-    fn code_art(&mut self) -> Result<()> {
-        // The net (`appearance.rs:151-199` `weave`): the player's own silhouette in mesh, strands
-        // and holes on a one-pixel check that runs unbroken across the sheet.
-        let strand = self.named("Net", "strand");
-        let hole = self.named("Net", "hole");
-        let player = IRect::new(LEFT, PLAYER_Y, 10 * TILE as u32, TILE as u32);
-        for y in 0..player.h as i32 {
-            for x in 0..player.w as i32 {
-                let p = player.min() + IVec2::new(x, y);
-                if self.grid(self.l.art).get(p) != 0 {
-                    let v = if (x + y) % 2 == 0 { strand } else { hole };
-                    self.grid(self.l.net).set(p, v);
+        if let Some(ase) = self.aseprite(name, count, &img)? {
+            for (l, layer) in ase.layers.iter().enumerate().filter(|(_, l)| !l.visible && !l.group) {
+                let layer_name = pixelle_core::import::snake(&layer.name);
+                s.layers.push(SpriteLayer { name: layer_name.clone(), export: false, visible: false });
+                for f in 0..count {
+                    let pic = self.indexed(&rgba(&ase.frames[f][l], ase.width, ase.height), sections, &format!("{name} {}", layer.name))?;
+                    s.frames[f].set_layer(&layer_name, pic);
                 }
+                self.notes.push(format!("{name}.aseprite's hidden layer {:?} is the layer {layer_name:?}, hidden and not exported", layer.name));
             }
         }
+        self.p.sprites.insert(name.into(), s);
+        Ok(())
+    }
 
-        // The bullet (`weapon.rs:479-480`): a 3x1 quad.
+    /// A sheet's `.aseprite`, checked against its PNG.
+    fn aseprite(&mut self, name: &str, count: usize, png: &RgbaImage) -> Result<Option<aseprite::Ase>> {
+        let path = self.root.join(format!("assets/images/{name}.aseprite"));
+        if !path.exists() {
+            return Ok(None);
+        }
+        let ase = aseprite::parse(&std::fs::read(&path)?).with_context(|| format!("reading {}", path.display()))?;
+        if ase.frames.len() != count || (ase.width, ase.height) != (TILE, TILE) {
+            self.notes.push(format!("{name}.aseprite has {} frames of {}x{}, the PNG {count}; its hidden layers were left out", ase.frames.len(), ase.width, ase.height));
+            return Ok(None);
+        }
+        let stale: Vec<usize> = (0..count)
+            .filter(|&f| normalise(&rgba(&ase.visible(f), ase.width, ase.height)) != normalise(&crop(png, IRect::new((f as u32 * TILE) as i32, 0, TILE, TILE))))
+            .collect();
+        if !stale.is_empty() {
+            self.notes.push(format!("{name}.png differs from {name}.aseprite in frames {stale:?}; the PNG (what the game draws) was used"));
+        }
+        Ok(Some(ase))
+    }
+
+    /// The walls: `cladding.rs`'s seven frames, each turned every way the terrain draws it.
+    fn walls(&mut self) -> Result<()> {
+        let img = self.png("walls")?;
+        ensure!(img.w / TILE == WALL_FRAMES as u32, "walls.png has {} frames, cladding.rs draws from {WALL_FRAMES}", img.w / TILE);
+        let pic = self.indexed(&img, &[], "walls")?;
+        let canonical: Vec<Indexed> = (0..WALL_FRAMES as u32).map(|f| pic.crop(f * TILE, 0, TILE, TILE)).collect();
+        let preset = Preset::TwoSurface { mirror: false };
+        let mut t = TerrainFile::new(preset, TILE);
+        t.tiles = presets::expand_mirrored(&preset.two_surface().slots, &canonical);
+        self.p.terrains.insert("walls".into(), t);
+        self.sheets.push(("walls".into(), img.clone()));
+        if let Some(ase) = self.aseprite("walls", WALL_FRAMES, &img)?
+            && ase.layers.iter().any(|l| !l.visible && !l.group)
+        {
+            self.notes.push("walls.aseprite has hidden layers; a terrain has one layer, so they were left out".into());
+        }
+        Ok(())
+    }
+
+    /// What the showcase shows off: anchors, cuts, recolour slots and the art drawn in code.
+    fn showcase(&mut self) -> Result<()> {
+        let player = self.p.sprites.get_mut("player").context("player")?;
+        for (i, f) in player.frames.iter_mut().enumerate() {
+            f.points.insert("hand".into(), hand_pixel(i));
+        }
+        let idle = &mut player.frames[0];
+        for (name, [l, t, r, b]) in RAGDOLL_CUTS {
+            idle.rects.insert(name.into(), IRect::new(l, t, (r - l) as u32, (b - t) as u32));
+        }
+        // `killfeed.rs` `FACE_CUT`.
+        idle.rects.insert("face".into(), IRect::new(2, 0, 4, 4));
+
+        let weapons = self.p.sprites.get_mut("weapons").context("weapons")?;
+        for (f, (_, held, shoots, [dx, dy])) in weapons.frames.iter_mut().zip(WEAPONS) {
+            if held {
+                f.points.insert("trigger".into(), TRIGGER);
+            }
+            if shoots {
+                f.points.insert("muzzle".into(), MUZZLE);
+            }
+            f.points.insert("rest".into(), IVec2::new(4 + dx, 4 - dy));
+        }
+
+        // The bullet (`weapon.rs`): a 3x1 quad.
         let bullet = self.named("World", "bullet");
-        self.grid(self.l.art).fill_rect(IRect::new(LEFT, BULLET_Y, 3, 1), bullet);
+        let mut s = SpriteFile::new(3, 1);
+        s.frames[0].set_layer("art", Indexed { w: 3, h: 1, px: vec![bullet; 3] });
+        self.p.sprites.insert("fx/bullet".into(), s);
 
-        // The blast (`weapon.rs:2558` `blast_radius`): a white disc, a frame per tick.
+        // The blast (`weapon.rs` `blast_radius`): a white disc, a frame per tick.
         let blast = self.named("World", "blast");
-        let c = (BLAST as f32) / 2.0;
+        let c = BLAST as f32 / 2.0;
+        let mut s = SpriteFile::new(BLAST, BLAST);
+        s.frames.clear();
         for f in 0..EXPLOSION_TICKS {
             let r = blast_radius(f);
-            let at = IVec2::new(BLAST_X + f as i32 * BLAST_STRIDE, FX_Y);
-            for y in 0..BLAST as i32 {
-                for x in 0..BLAST as i32 {
+            let mut pic = Indexed::new(BLAST, BLAST);
+            for y in 0..BLAST {
+                for x in 0..BLAST {
                     let (dx, dy) = (x as f32 + 0.5 - c, y as f32 + 0.5 - c);
                     // Strictly inside: a disc of radius 0 draws nothing, as the scaled mesh does.
                     if dx * dx + dy * dy < r * r {
-                        self.grid(self.l.art).set(at + IVec2::new(x, y), blast);
+                        pic.set(x, y, blast);
                     }
                 }
             }
+            let mut frame = SpriteFrame::new(BLAST, BLAST);
+            frame.duration = TICK;
+            frame.set_layer("art", pic);
+            s.frames.push(frame);
         }
-
-        // The flag pads (`props.rs:196`): the weapon mark under each team's colour, tinted the way
-        // a sprite's colour tints it.
-        self.p.palette.begin_section("Flag pads");
-        let mark = strip(PROPS_Y, 0);
-        for (team, shirt) in [("red", 12), ("blue", 4)] {
-            let [r, g, b] = CLOTHING[shirt].1;
-            let at = IVec2::new(LEFT + (if team == "red" { 5 } else { 6 }) * TILE, PROPS_Y);
-            for y in 0..TILE {
-                for x in 0..TILE {
-                    let v = self.grid(self.l.art).get(mark.min() + IVec2::new(x, y));
-                    if v == 0 {
-                        continue;
-                    }
-                    let c = tint(self.p.palette.rgba(v), [r, g, b]);
-                    let pal = &mut self.p.palette;
-                    let t = match pal.find(c, Some("Flag pads")) {
-                        Some(t) => t,
-                        None => {
-                            let n = pal.section("Flag pads").map_or(0, |s| s.len);
-                            pal.push(format!("{team} {}", n / 2 + 1), c)?
-                        }
-                    };
-                    self.grid(self.l.art).set(at + IVec2::new(x, y), t);
-                }
-            }
-        }
-
-        // A platform one tile long (`cladding.rs` `run`): the sheet has no frame for it, so the
-        // game draws the outer half of each cap side by side. Here it is a frame of its own.
-        let h = TILE / 2;
-        for y in 0..TILE {
-            for x in 0..TILE {
-                let from = if x < h { strip(PLATFORMS_Y, 0).min() + IVec2::new(x, y) } else { strip(PLATFORMS_Y, 2).min() + IVec2::new(x, y) };
-                let v = self.grid(self.l.art).get(from);
-                self.grid(self.l.art).set(strip(PLATFORMS_Y, 3).min() + IVec2::new(x, y), v);
-            }
-        }
-
-        // The level editor's marks (`editor.rs`), which it draws as flat quads: the hover is a
-        // plain white cell the game tints with the tool's colour, the selection a frame in the
-        // picked blue.
-        let hover = self.named("DawnBringer 32", "white");
-        let selection = self.named("Editor", "picked edge");
-        let problem = self.named("Editor", "problem");
-        let art = self.l.art;
-        let g = self.grid(art);
-        g.fill_rect(strip(PROPS_Y, 8), hover);
-        let sel = strip(PROPS_Y, 9);
-        g.fill_rect(sel, selection);
-        g.fill_rect(sel.grow(-1), 0);
-        g.fill_rect(strip(PROPS_Y, 10), problem);
-
-        // The sky and the flat fill are single colours; the level's backdrop shows the sky.
-        Ok(())
-    }
-
-    fn add(&mut self, sprite: Sprite) {
-        self.p.sprites.push(sprite);
-    }
-
-    fn sprites(&mut self) -> Result<()> {
-        let art = vec![self.l.art];
-
-        // The player: every pose by name, each with the pixel it holds a weapon by, plus the
-        // cycles, the whole sheet by pose index, and the net over it.
-        let pose = |i: usize| {
-            let mut f = Frame::new(strip(PLAYER_Y, i as i32)).with_point("hand", hand_pixel(i));
-            if i == IDLE as usize {
-                // `ragdoll.rs` `cut_of`: the pieces a body breaks into, cut from the standing
-                // frame; and `killfeed.rs` `FACE_CUT`, the face a death row shows.
-                for (name, [l, t, r, b]) in RAGDOLL_CUTS {
-                    f = f.with_rect(name, IRect::new(l, t, (r - l) as u32, (b - t) as u32));
-                }
-                f = f.with_rect("face", IRect::new(2, 0, 4, 4));
-            }
-            f
-        };
-        let poses: Vec<Frame> = (0..POSES.len()).map(pose).collect();
-        self.add(tagged(
-            Sprite::new("player/poses", art.clone(), poses),
-            "frames",
-            &POSES.join(","),
-        ));
-        for (i, name) in POSES.iter().enumerate() {
-            if !matches!(*name, "run_1" | "run_2" | "crouch_walk") {
-                self.add(Sprite::new(format!("player/{name}"), art.clone(), vec![pose(i)]));
-            }
-        }
-        self.add(Sprite::new(
-            "player/run",
-            art.clone(),
-            vec![pose(1).with_duration(RUN_FRAME_TIME), pose(2).with_duration(RUN_FRAME_TIME)],
-        ));
-        self.add(Sprite::new(
-            "player/crouch_walk",
-            art.clone(),
-            vec![pose(8).with_duration(RUN_FRAME_TIME), pose(9).with_duration(RUN_FRAME_TIME)],
-        ));
-        self.add(Sprite::new(
-            "player/net",
-            vec![self.l.net],
-            (0..POSES.len()).map(|i| Frame::new(strip(PLAYER_Y, i as i32))).collect(),
-        ));
-
-        // Weapons: seated on a hand by `trigger`, firing from `muzzle`, lying centred by `rest`.
-        let weapon = |i: usize| {
-            let (_, held, shoots, [dx, dy]) = WEAPONS[i];
-            let mut f = Frame::new(strip(WEAPONS_Y, i as i32));
-            if held {
-                f = f.with_point("trigger", TRIGGER);
-            }
-            if shoots {
-                f = f.with_point("muzzle", MUZZLE);
-            }
-            f.with_point("rest", IVec2::new(4 + dx, 4 - dy))
-        };
-        for (i, (name, ..)) in WEAPONS.iter().enumerate() {
-            if matches!(*name, "shell_1" | "shell_2" | "rocket_1" | "rocket_2") {
-                continue;
-            }
-            self.add(Sprite::new(format!("weapons/{name}"), art.clone(), vec![weapon(i)]));
-        }
-        let (ring, core) = (SHELL_RING_TICKS * TICK, SHELL_CORE_TICKS * TICK);
-        self.add(Sprite::new(
-            "weapons/shell",
-            art.clone(),
-            vec![weapon(3).with_duration(ring), weapon(4).with_duration(core)],
-        ));
-        self.add(Sprite::new(
-            "weapons/rocket",
-            art.clone(),
-            vec![weapon(8).with_duration(ring), weapon(9).with_duration(core)],
-        ));
-        self.add(Sprite::new(
-            "weapons/bullet",
-            art.clone(),
-            vec![Frame::new(IRect::new(LEFT, BULLET_Y, 3, 1))],
-        ));
-
-        // Props.
-        let prop = |i: i32| Frame::new(strip(PROPS_Y, i));
-        self.add(Sprite::new("props/weapon_mark", art.clone(), vec![prop(0)]));
-        self.add(tagged(
-            Sprite::new("props/jump_pad", art.clone(), vec![prop(1), prop(2)]),
-            "frames",
-            "rest,sprung",
-        ));
-        self.add(Sprite::new("props/spikes", art.clone(), vec![prop(3)]));
-        self.add(Sprite::new("props/flag_pad_red", art.clone(), vec![prop(5)]));
-        self.add(Sprite::new("props/flag_pad_blue", art.clone(), vec![prop(6)]));
-        self.add(Sprite::new("editor/hover", art.clone(), vec![prop(8)]));
-        self.add(Sprite::new("editor/selection", art.clone(), vec![prop(9)]));
-        self.add(Sprite::new("editor/problem", art.clone(), vec![prop(10)]));
-
-        // Emotes, in key order (`net.rs` `Emote`).
-        for (i, name) in ["cry", "angry", "laugh", "cool"].iter().enumerate() {
-            self.add(Sprite::new(
-                format!("emotes/{name}"),
-                art.clone(),
-                vec![Frame::new(strip(EMOTES_Y, i as i32))],
-            ));
-        }
-
-        // The wall sheet as `cladding.rs` addresses it: seven drawn frames and three transposes,
-        // so an engine that can only flip gets every orientation.
-        let mut walls: Vec<Frame> = (0..7).map(|i| Frame::new(strip(WALLS_Y, i))).collect();
-        for i in [1, 2, 3] {
-            walls.push(Frame::new(strip(WALLS_Y, i)).with_transform(D4::TRANSPOSE));
-        }
-        self.add(tagged(Sprite::new("walls/sheet", art.clone(), walls), "frames", &WALL_FRAMES.join(",")));
-
-        // Platforms: ink only on the bottom five rows (`cladding.rs:111-118`).
-        let ink = IRect::new(0, 3, TILE as u32, 5);
-        self.add(tagged(
-            Sprite::new(
-                "platforms/sheet",
-                art.clone(),
-                (0..4).map(|i| Frame::new(strip(PLATFORMS_Y, i)).with_rect("ink", ink)).collect(),
-            ),
-            "frames",
-            "cap_left,middle,cap_right,single",
-        ));
-
-        // The blast, one frame per tick, pivoting on its centre.
-        let mut blast = Sprite::new(
-            "fx/explosion",
-            art,
-            (0..EXPLOSION_TICKS)
-                .map(|f| {
-                    Frame::new(IRect::new(BLAST_X + f as i32 * BLAST_STRIDE, FX_Y, BLAST, BLAST))
-                        .with_duration(TICK)
-                })
-                .collect(),
-        );
-        blast.pivot = Some(IVec2::splat(BLAST as i32 / 2));
-        blast.tags.insert("radius".into(), "18 * sin(pi * tick / 8)".into());
-        self.add(blast);
+        s.pivot = Some(IVec2::splat(BLAST as i32 / 2));
+        s.tags.insert("radius".into(), "18 * sin(pi * tick / 8)".into());
+        self.p.sprites.insert("fx/explosion".into(), s);
 
         // Recolour slots: the sheet's tones, and where a player picks replacements from.
         for (name, _) in PLAYER_KEYS {
             let options = if name == "skin" { "Skin tones" } else { "Clothing" };
             let index = self.named("Player keys", name);
-            self.p.swaps.push(SwapSlot {
-                name: name.into(),
-                index,
-                options: options.into(),
-            });
+            self.p.swaps.push(SwapSlot { name: name.into(), index, options: options.into() });
         }
         Ok(())
     }
 
-    fn terrains(&mut self) {
-        let art = vec![self.l.art];
-        self.p.tilesets.push(Tileset {
-            name: "walls".into(),
-            origin: IVec2::new(LEFT, WALLS_Y),
-            tile_size: TILE as u32,
-            columns: 7,
-            count: 7,
-            layers: art.clone(),
-        });
-        self.p.tilesets.push(Tileset {
-            name: "platforms".into(),
-            origin: IVec2::new(LEFT, PLATFORMS_Y),
-            tile_size: TILE as u32,
-            columns: 4,
-            count: 4,
-            layers: art,
-        });
-        // `cladding.rs` `clad_terrain`: whole frames where one is exactly right, quarters
-        // everywhere else. `verify` checks every neighbourhood against it.
-        let roles = MinimalD4 {
-            corner: 0,
-            edge: 1,
-            strip_end: 2,
-            strip: 3,
-            interior: 4,
-            inside: 5,
-            double_inside: 6,
-        };
-        self.p.terrains.push(Terrain {
-            name: "walls".into(),
-            tileset: "walls".into(),
-            rules: presets::minimal_d4(roles),
-            fallback: None,
-            quarters: presets::quarters_d4(roles),
-        });
-        self.p.terrains.push(Terrain {
-            name: "platforms".into(),
-            tileset: "platforms".into(),
-            rules: presets::horizontal_run(0, 1, 2, 3),
-            fallback: None,
-            quarters: Vec::new(),
-        });
-    }
-
-    /// Paint the showcase and put the cast in it.
-    fn level(&mut self) -> Result<()> {
-        let walls = self.p.terrain_id("walls").unwrap();
-        let girders = self.p.terrain_id("platforms").unwrap();
-        let top = MOCK_Y / TILE;
-        let width = LEVEL[0].len() as i32;
-        let mut cells = Grid::new();
-        for (y, row) in LEVEL.iter().enumerate() {
-            ensure!(row.len() as i32 == width, "level row {y} is {} wide", row.len());
-            for (x, c) in row.chars().enumerate() {
-                let v = match c {
-                    '#' => walls,
-                    '=' => girders,
-                    '.' => continue,
-                    other => bail!("level cell {other:?}"),
-                };
-                cells.set(IVec2::new(x as i32, top + y as i32), v);
-            }
-        }
-        if let LayerKind::Terrain(t) = &mut self.p.layer_mut(self.l.level).unwrap().kind {
-            t.cells = cells;
-        }
-        let area = IRect::new(0, MOCK_Y, (width * TILE) as u32, (LEVEL.len() as i32 * TILE) as u32);
-        let sky = self.named("World", "sky");
-        let l = self.l.sky;
-        self.grid(l).fill_rect(area, sky);
-
-        let sheets = self.p.layer(self.l.art).unwrap().pixels().unwrap().bounds().unwrap();
-        let sheets = sheets.union(&self.p.layer(self.l.wip).unwrap().pixels().unwrap().bounds().unwrap());
-        self.p.bookmarks = vec![
-            Bookmark { name: "Sheets".into(), rect: IRect::new(0, 0, sheets.max().x as u32 + 8, sheets.max().y as u32 + 8) },
-            Bookmark { name: "Mockup".into(), rect: area },
-        ];
-
-        self.cast()
-    }
-
-    fn cast(&mut self) -> Result<()> {
-        // Standing on the surface of row `row` of the level, in column `col`.
-        let on = |col: i32, row: i32| IVec2::new(col * TILE, MOCK_Y + row * TILE - TILE);
-        // Standing on a girder in row `row`: its ink starts three rows down.
-        let on_girder = |col: i32, row: i32| IVec2::new(col * TILE, MOCK_Y + row * TILE + 3 - TILE);
-        let at = |col: i32, row: i32| IVec2::new(col * TILE, MOCK_Y + row * TILE);
-
-        let red = self.look(["near-black", "flag red", "near-black", "brown"], 0);
-        let blue = self.look(["blond", "navy", "grey", "near-black"], 3);
-
-        // Pads, marks, spikes and what lies on them.
-        self.prop("props/flag_pad_red", 0, on(1, 13));
-        self.prop("props/flag_pad_blue", 0, on(36, 11));
-        self.prop("props/weapon_mark", 0, on(11, 13));
-        self.resting("weapons/grenade_capped", on(11, 13));
-        self.prop("props/weapon_mark", 0, on(28, 13));
-        self.resting("weapons/rocket_launcher", on(28, 13));
-        self.prop("props/weapon_mark", 0, on_girder(18, 11));
-        self.resting("weapons/sword", on_girder(18, 11));
-        self.prop("props/jump_pad", 0, on(13, 13));
-        self.prop("props/jump_pad", 1, on(24, 13));
-        for col in 15..=20 {
-            self.prop("props/spikes", 0, on(col, 13));
-        }
-
-        // The cast.
-        self.actor(IDLE, on(3, 13), false, red.clone(), Some("weapons/flag_red"), None);
-        let shotgun = self.actor(
-            RUN_1,
-            on(9, 13),
-            false,
-            self.look(["blond", "green", "navy", "brown"], 2),
-            Some("weapons/shotgun"),
-            Some("emotes/angry"),
-        );
-        if let Some(muzzle) = shotgun {
-            for k in 0..3 {
-                self.actor_sprite("weapons/bullet", 0, muzzle + IVec2::new(4 + k * 9, 0), D4::IDENTITY);
-            }
-        }
-        let rocket = self.actor(
-            JUMP_ARMED,
-            at(12, 9),
-            false,
-            self.look(["rust", "purple", "near-black", "grey"], 4),
-            Some("weapons/rocket_launcher"),
-            None,
-        );
-        if let Some(muzzle) = rocket {
-            self.actor_sprite("weapons/rocket", 0, muzzle + IVec2::new(30, -4), D4::IDENTITY);
-        }
-        self.actor_sprite(
-            "fx/explosion",
-            4,
-            IVec2::new(15 * TILE + 4, MOCK_Y + 5 * TILE + 4) - IVec2::splat(BLAST as i32 / 2),
-            D4::IDENTITY,
-        );
-        self.actor(
-            WALL_SLIDE_ARMED,
-            at(30, 11),
-            true,
-            self.look(["near-black", "cyan", "grey", "near-black"], 6),
-            Some("weapons/handgun"),
-            None,
-        );
-        let launcher = self.actor(
-            CROUCH,
-            on(34, 13),
-            true,
-            self.look(["brown", "yellow", "navy", "brown"], 1),
-            Some("weapons/grenade_launcher"),
-            None,
-        );
-        if let Some(muzzle) = launcher {
-            self.actor_sprite("weapons/shell", 0, muzzle + IVec2::new(-20, -14), D4::IDENTITY);
-        }
-        let netter = self.actor(
-            SLIDE,
-            on(21, 13),
-            false,
-            self.look(["pink", "white", "purple", "near-black"], 5),
-            Some("weapons/net_gun"),
-            None,
-        );
-        if let Some(muzzle) = netter {
-            self.actor_sprite("weapons/net", 0, muzzle + IVec2::new(10, -4), D4::IDENTITY);
-        }
-        // Caught: the body in its colours, the net over it from its own layer.
-        let caught = on(26, 13);
-        self.actor(IDLE, caught, true, self.look(["near-black", "grey", "navy", "brown"], 7), None, Some("emotes/cry"));
-        self.actor_sprite("player/net", IDLE, caught, D4::FLIP_X);
-        self.actor(IDLE, on_girder(5, 2), false, self.look(["blond", "rust", "navy", "brown"], 0), Some("weapons/sword"), Some("emotes/laugh"));
-        self.actor(IDLE, on(37, 11), true, blue, Some("weapons/flag_blue"), Some("emotes/cool"));
-        self.actor(JUMP, at(20, 4), true, self.look(["grey", "near-black", "green", "brown"], 2), None, None);
-        Ok(())
-    }
-
-    fn look(&self, clothes: [&str; 4], skin: usize) -> Vec<(String, u8)> {
-        let mut out: Vec<(String, u8)> = ["hair", "shirt", "pants", "shoes"]
-            .iter()
-            .zip(clothes)
-            .map(|(slot, name)| (slot.to_string(), self.named("Clothing", name)))
-            .collect();
-        let skin = self.p.palette.section("Skin tones").unwrap().start as u8 + skin as u8;
-        out.push(("skin".into(), skin));
-        out
-    }
-
-    fn instances(&mut self, layer: LayerId) -> &mut Vec<Instance> {
-        match &mut self.p.layer_mut(layer).unwrap().kind {
-            LayerKind::Instances(v) => v,
-            _ => unreachable!("an instance layer"),
-        }
-    }
-
-    fn prop(&mut self, sprite: &str, frame: u32, pos: IVec2) {
-        let l = self.l.props;
-        self.instances(l).push(Instance {
-            sprite: sprite.into(),
-            frame,
-            pos,
-            transform: D4::IDENTITY,
-            swaps: Vec::new(),
-        });
-    }
-
-    /// A weapon lying loose in a cell, pulled back to its middle by its `rest` point.
-    fn resting(&mut self, sprite: &str, cell: IVec2) {
-        let rest = self.point(sprite, 0, "rest").unwrap_or(IVec2::splat(4));
-        self.prop(sprite, 0, cell - (rest - IVec2::splat(4)));
-    }
-
-    fn actor_sprite(&mut self, sprite: &str, frame: u32, pos: IVec2, transform: D4) {
-        let l = self.l.actors;
-        self.instances(l).push(Instance {
-            sprite: sprite.into(),
-            frame,
-            pos,
-            transform,
-            swaps: Vec::new(),
-        });
-    }
-
-    fn point(&self, sprite: &str, frame: usize, name: &str) -> Option<IVec2> {
-        self.p.sprite(sprite)?.frames.get(frame)?.points.get(name).copied()
-    }
-
-    /// A player in a pose, holding a weapon by the file's own anchors: the pose's `hand` on the
-    /// weapon's `trigger`, both mirrored for a player facing left. Returns the muzzle, if any, in
-    /// canvas pixels.
-    fn actor(
-        &mut self,
-        pose: u32,
-        pos: IVec2,
-        left: bool,
-        look: Vec<(String, u8)>,
-        weapon: Option<&str>,
-        emote: Option<&str>,
-    ) -> Option<IVec2> {
-        let flip = if left { D4::FLIP_X } else { D4::IDENTITY };
-        let mirror = |p: IVec2| if left { IVec2::new(TILE - 1 - p.x, p.y) } else { p };
-        let l = self.l.actors;
-        self.instances(l).push(Instance {
-            sprite: "player/poses".into(),
-            frame: pose,
-            pos,
-            transform: flip,
-            swaps: look,
-        });
-        if let Some(emote) = emote {
-            self.actor_sprite(emote, 0, pos - IVec2::new(0, TILE + 1), D4::IDENTITY);
-        }
-        let weapon = weapon?;
-        let hand = mirror(self.point("player/poses", pose as usize, "hand")?);
-        let trigger = mirror(self.point(weapon, 0, "trigger")?);
-        let at = pos + hand - trigger;
-        self.actor_sprite(weapon, 0, at, flip);
-        self.point(weapon, 0, "muzzle").map(|m| at + mirror(m))
-    }
-
-    /// Every sheet comes back out of the file exactly, and the wall terrain draws what
+    /// Every sheet comes back out of the project exactly, and the walls terrain draws what
     /// `cladding.rs` would.
-    fn verify(&self) -> Result<()> {
-        let mut r = Renderer::new(&self.p);
-        for (name, at, png) in &self.sheets {
-            let rect = IRect::new(at.x, at.y, png.w, png.h);
-            let back = r.indexed(rect, &[self.l.art]).to_rgba(&self.p.palette);
+    fn verify(&mut self) -> Result<()> {
+        let mut notes = Vec::new();
+        let baked = bake::bake_folder(&self.p);
+        for (name, png) in &self.sheets {
+            if name == "walls" {
+                continue;
+            }
+            let back = baked.sheet_rgba(name).with_context(|| format!("no sprite {name}"))?;
             ensure!(normalise(&back) == normalise(png), "{name}.png does not survive the round trip");
         }
 
         // `derive_wall_sheet`: the drawn frames, then TOP, COLUMN_HEAD and COLUMN_BODY transposed.
-        let (_, _, walls) = self.sheets.iter().find(|(n, ..)| n == "walls").context("walls")?;
-        for f in 0..10 {
-            let got = r.frame("walls/sheet", f).unwrap().to_rgba(&self.p.palette);
-            let src = if f < 7 { f } else { [1, 2, 3][f - 7] };
-            let mut want = crop(walls, IRect::new(src as i32 * TILE, 0, TILE as u32, TILE as u32));
-            if f >= 7 {
-                want = transpose(&want);
-            }
-            ensure!(normalise(&got) == normalise(&want), "walls/sheet frame {f} ({})", WALL_FRAMES[f]);
-        }
-
-        // The walls terrain draws every neighbourhood exactly as run-2d's grid cladding does.
+        let (_, walls) = self.sheets.iter().find(|(n, _)| n == "walls").context("walls")?;
         let derived: Vec<RgbaImage> = (0..10)
             .map(|f| {
                 let src = if f < 7 { f } else { [1, 2, 3][f - 7] };
-                let img = crop(walls, IRect::new(src as i32 * TILE, 0, TILE as u32, TILE as u32));
+                let img = crop(walls, IRect::new(src as i32 * TILE as i32, 0, TILE, TILE));
                 if f >= 7 { transpose(&img) } else { img }
             })
             .collect();
-        let walls_id = self.p.terrain_id("walls").context("walls terrain")?;
-        let mut scratch = self.p.clone();
-        let probe = scratch.add_layer("probe", LayerKind::Terrain(TerrainLayer { cell_size: TILE as u32, cells: Grid::new() }));
-        // Far from anything else on the canvas.
-        let origin = IVec2::new(-1000, -1000);
+        let terrain = baked.terrain("walls").context("walls terrain")?;
+        let atlas = Indexed { w: baked.atlas_width, h: baked.atlas_height, px: baked.atlas.clone() };
+        let mut quartered = Vec::new();
         for mask in 0..=255u8 {
             let solid = |d: IVec2| {
                 let slot = pixelle_core::tiles::NEIGHBOURS.iter().position(|n| *n == d);
                 slot.is_none_or(|s| mask & (1 << s) != 0)
             };
-            if let LayerKind::Terrain(t) = &mut scratch.layer_mut(probe).unwrap().kind {
-                t.cells = Grid::new();
-                for dy in -1..=1 {
-                    for dx in -1..=1 {
-                        if solid(IVec2::new(dx, dy)) {
-                            t.cells.set(origin + IVec2::new(dx, dy), walls_id);
-                        }
-                    }
-                }
+            let mut ours = Indexed::new(TILE, TILE);
+            for piece in terrain.cell(solid) {
+                let src = atlas.crop(piece.source.x as u32, piece.source.y as u32, piece.source.w, piece.source.h);
+                ours.blit(&src.transformed(pixelle_core::D4::new(false, piece.flip_x, piece.flip_y)), piece.at.min());
             }
-            let at = origin * TILE;
-            let ours = Renderer::new(&scratch)
-                .indexed(IRect::new(at.x, at.y, TILE as u32, TILE as u32), &[probe])
-                .to_rgba(&scratch.palette);
+            let ours = ours.to_rgba(&self.p.palette);
             // y up, as run-2d asks: open(dc, dr).
             let open = |dc: i32, dr: i32| !solid(IVec2::new(dc, -dr));
-            let theirs = run2d_cell(&derived, open);
-            ensure!(normalise(&ours) == normalise(&theirs), "walls terrain differs from cladding.rs for neighbourhood {mask:08b}");
+            let (theirs, whole) = run2d_cell(&derived, open);
+            if normalise(&ours) == normalise(&theirs) {
+                continue;
+            }
+            // Where cladding.rs draws a whole frame, the terrain must draw exactly that. Where it
+            // builds a cell from quarters, it mirrors each frame's top-left quarter into every
+            // corner; with the mirror off a quarter comes from that corner of the tile as drawn,
+            // so a frame that is not symmetric differs there by its own texture.
+            ensure!(!whole, "walls terrain differs from cladding.rs for neighbourhood {mask:08b}, a whole frame");
+            quartered.push(normalise(&ours).iter().zip(normalise(&theirs)).filter(|(a, b)| *a != b).count());
         }
 
-        // A lone platform cell draws what `run` draws for a one-tile platform: the left cap's
-        // outer half, then the right cap's.
-        let (_, _, girders) = self.sheets.iter().find(|(n, ..)| n == "platforms").context("platforms")?;
-        let mut lone = RgbaImage::new(TILE as u32, TILE as u32);
-        for y in 0..TILE as u32 {
-            for x in 0..TILE as u32 {
-                let sx = if x < TILE as u32 / 2 { x } else { 2 * TILE as u32 + x };
-                let s = ((y * girders.w + sx) * 4) as usize;
-                let d = ((y * TILE as u32 + x) * 4) as usize;
-                lone.px[d..d + 4].copy_from_slice(&girders.px[s..s + 4]);
-            }
-        }
-        let platforms_id = self.p.terrain_id("platforms").context("platforms terrain")?;
-        if let LayerKind::Terrain(t) = &mut scratch.layer_mut(probe).unwrap().kind {
-            t.cells = Grid::new();
-            t.cells.set(origin, platforms_id);
-        }
-        let at = origin * TILE;
-        let drawn = Renderer::new(&scratch)
-            .indexed(IRect::new(at.x, at.y, TILE as u32, TILE as u32), &[probe])
-            .to_rgba(&scratch.palette);
-        ensure!(normalise(&drawn) == normalise(&lone), "a one-cell platform differs from cladding.rs run()");
-
-        // Every frame of every sheet is reachable by some sprite name.
-        let mut covered: BTreeMap<(i32, i32), ()> = BTreeMap::new();
-        for s in &self.p.sprites {
-            for f in &s.frames {
-                covered.insert((f.rect.x, f.rect.y), ());
-            }
-        }
-        for (name, at, png) in &self.sheets {
-            for f in 0..(png.w as i32 / TILE) {
-                ensure!(
-                    covered.contains_key(&(at.x + f * TILE, at.y)),
-                    "{name}.png frame {f} has no sprite"
-                );
-            }
+        if !quartered.is_empty() {
+            notes.push(format!(
+                "walls: {} of 256 neighbourhoods built from quarters differ from cladding.rs by at most {} pixels, because \
+                 quarters now come from each tile's own corners instead of a mirrored top-left quarter",
+                quartered.len(),
+                quartered.iter().max().unwrap()
+            ));
         }
 
         // Explosion frames are exactly as wide as the disc the game scales.
-        for f in 0..EXPLOSION_TICKS as usize {
-            let pic = r.frame("fx/explosion", f).unwrap();
-            let across = (0..BLAST).filter(|&x| pic.get(x, BLAST / 2) != 0).count() as f32;
-            let r = blast_radius(f as u32);
-            ensure!((across - 2.0 * r).abs() <= 1.5, "blast frame {f}: {across}px across for radius {r}");
+        if let Some(blast) = self.p.sprites.get("fx/explosion") {
+            for f in 0..EXPLOSION_TICKS as usize {
+                let pic = blast.composite(f);
+                let across = (0..BLAST).filter(|&x| pic.get(x, BLAST / 2) != 0).count() as f32;
+                let r = blast_radius(f as u32);
+                ensure!((across - 2.0 * r).abs() <= 1.5, "blast frame {f}: {across}px across for radius {r}");
+            }
         }
+        self.notes.extend(notes);
         Ok(())
     }
 }
@@ -1193,11 +643,6 @@ fn blast_radius(age: u32) -> f32 {
     EXPLOSION_RADIUS * (age as f32 / EXPLOSION_TICKS as f32 * std::f32::consts::PI).sin()
 }
 
-fn tagged(mut s: Sprite, key: &str, value: &str) -> Sprite {
-    s.tags.insert(key.into(), value.into());
-    s
-}
-
 fn rgba(px: &[[u8; 4]], w: u32, h: u32) -> RgbaImage {
     RgbaImage {
         w,
@@ -1239,9 +684,9 @@ fn normalise(img: &RgbaImage) -> Vec<[u8; 4]> {
 }
 
 /// `cladding.rs` at e59b281: `Around`, `whole_frame`, `quarter` and the drawing in `clad_terrain`,
-/// ported to produce the picture of one cell. `open(dc, dr)` is whether the neighbour that many
-/// columns across and rows up is open.
-fn run2d_cell(sheet: &[RgbaImage], open: impl Fn(i32, i32) -> bool) -> RgbaImage {
+/// ported to produce the picture of one cell, and whether it is a whole frame. `open(dc, dr)` is
+/// whether the neighbour that many columns across and rows up is open.
+fn run2d_cell(sheet: &[RgbaImage], open: impl Fn(i32, i32) -> bool) -> (RgbaImage, bool) {
     const CORNER: usize = 0;
     const TOP: usize = 1;
     const COLUMN_HEAD: usize = 2;
@@ -1282,7 +727,7 @@ fn run2d_cell(sheet: &[RgbaImage], open: impl Fn(i32, i32) -> bool) -> RgbaImage
         _ => None,
     };
     if let Some((f, fx, fy)) = whole {
-        return flip(&sheet[f], fx, fy);
+        return (flip(&sheet[f], fx, fy), true);
     }
     let quarter = |vertical: bool, horizontal: bool, diagonal: bool| match (vertical, horizontal, diagonal) {
         (true, true, _) => (CORNER, false),
@@ -1308,7 +753,7 @@ fn run2d_cell(sheet: &[RgbaImage], open: impl Fn(i32, i32) -> bool) -> RgbaImage
             }
         }
     }
-    out
+    (out, false)
 }
 
 fn flip(img: &RgbaImage, fx: bool, fy: bool) -> RgbaImage {

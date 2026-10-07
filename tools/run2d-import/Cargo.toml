@@ -1,6 +1,6 @@
 [package]
 name = "run2d-import"
-description = "Generate run2d.pxl from run-2d's sheets and the art its code draws"
+description = "Turn run-2d's art into a Pixelle project folder"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

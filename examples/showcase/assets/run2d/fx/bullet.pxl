@@ -1,0 +1,19 @@
+Sprite(
+  version: 1,
+  layers: [
+    (
+      name: "art",
+    ),
+  ],
+  frames: [
+    (
+      w: 3,
+      h: 1,
+      pixels: {
+        "art": [
+          "3d3d3d",
+        ],
+      },
+    ),
+  ],
+)

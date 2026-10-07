@@ -1,12 +1,13 @@
 //! The Pixelle editor.
 //!
 //! ```text
-//! pixelle-editor [project.pxl] [--view <bookmark>] [--zoom <n>] [--select <sprite>]
-//!                [--tool <name>] [--layer <name>] [--screenshot <out.png>]
+//! pixelle-editor [project folder] [--open <file>] [--zoom <n>] [--tool <name>] [--layer <name>]
+//!                [--screenshot <out.png>]
 //! ```
 //!
-//! `--screenshot` renders the window once everything has loaded, saves it and quits: a way to
-//! look at the editor from a script.
+//! With no folder, it opens the project opened last. `--open` opens one of its files in a tab, by
+//! name (`weapons`, `wip/walls2`). `--screenshot` renders the window once everything has loaded,
+//! saves it and quits: a way to look at the editor from a script.
 
 mod app;
 mod backend;
@@ -16,35 +17,27 @@ mod doc;
 mod panels;
 mod tools;
 mod view;
+mod workspace;
 
 use std::path::PathBuf;
 
 fn main() -> anyhow::Result<()> {
-    let mut args = app::Args {
-        file: None,
-        screenshot: None,
-        view: None,
-        zoom: None,
-        select: None,
-        tool: None,
-        layer: None,
-    };
+    let mut args = app::Args { project: None, remember: true, screenshot: None, open: None, zoom: None, tool: None, layer: None };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         let mut value = || it.next().ok_or_else(|| anyhow::anyhow!("{a} needs a value"));
         match a.as_str() {
             "--screenshot" => args.screenshot = Some(PathBuf::from(value()?)),
-            "--view" => args.view = Some(value()?),
+            "--open" => args.open = Some(value()?),
             "--zoom" => args.zoom = Some(value()?.parse()?),
-            "--select" => args.select = Some(value()?),
             "--tool" => args.tool = Some(value()?),
             "--layer" => args.layer = Some(value()?),
             "-h" | "--help" => {
-                println!("pixelle-editor [project.pxl] [--view <bookmark>] [--zoom <n>] [--select <sprite>] [--tool <name>] [--layer <name>] [--screenshot <out.png>]");
+                println!("pixelle-editor [project folder] [--open <file>] [--zoom <n>] [--tool <name>] [--layer <name>] [--screenshot <out.png>]");
                 return Ok(());
             }
             _ if a.starts_with("--") => anyhow::bail!("unknown option {a}"),
-            _ => args.file = Some(PathBuf::from(a)),
+            _ => args.project = Some(PathBuf::from(a)),
         }
     }
     let editor = app::Editor::new(args)?;

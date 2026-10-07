@@ -3,7 +3,7 @@
 //! ```ignore
 //! // build.rs
 //! fn main() {
-//!     pixelle_build::Art::new("assets/art.pxl")
+//!     pixelle_build::Art::new("assets/art")
 //!         .bake_to("assets/art.pxlb")
 //!         .run()
 //!         .unwrap();
@@ -16,14 +16,16 @@
 //! // art::weapons::SHOTGUN, art::player::poses::CROUCH, art::points::MUZZLE, ...
 //! ```
 //!
-//! The constants are generated from the file every build, so renaming a sprite in the editor is a
-//! compile error at every place the game used the old name, rather than a missing sprite at run
-//! time. The baked file is what a release build ships; see [`pixelle_core::bake`].
+//! The constants are generated from the project every build, so renaming a sprite in the editor is
+//! a compile error at every place the game used the old name, rather than a missing sprite at run
+//! time. The baked file is what a web build ships, where reading a folder of text files would
+//! mean many more and larger downloads; see [`pixelle_core::bake`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+use pixelle_core::ProjectDir;
 use pixelle_core::bake::{self, Baked};
 
 pub struct Art {
@@ -34,9 +36,16 @@ pub struct Art {
 }
 
 impl Art {
+    /// `source` is the project folder, or its `project.pxl`.
     pub fn new(source: impl AsRef<Path>) -> Self {
+        let source = source.as_ref();
+        let source = if source.file_name().is_some_and(|n| n == pixelle_core::folder::ROOT) {
+            source.parent().unwrap_or(Path::new(".")).to_path_buf()
+        } else {
+            source.to_path_buf()
+        };
         Self {
-            source: source.as_ref().to_path_buf(),
+            source,
             bake_to: None,
             module: "art".into(),
             crate_path: "::bevy_pixelle".into(),
@@ -64,14 +73,18 @@ impl Art {
     /// Bake, generate, and tell Cargo to rerun when the project changes. Returns the generated
     /// file's path.
     pub fn run(self) -> Result<PathBuf, String> {
+        // A folder: Cargo looks for changes anywhere inside it.
         println!("cargo:rerun-if-changed={}", self.source.display());
-        let bytes = std::fs::read(&self.source).map_err(|e| format!("{}: {e}", self.source.display()))?;
-        let baked = bake::load_any(&bytes).map_err(|e| format!("{}: {e}", self.source.display()))?;
+        let project = ProjectDir::load(&self.source).map_err(|e| format!("{}/{e}", self.source.display()))?;
+        for problem in project.validate() {
+            println!("cargo:warning=pixelle: {problem}");
+        }
+        let baked = bake::bake_folder(&project);
         if let Some(to) = &self.bake_to {
             let out = baked.to_bytes();
             // Leave the file alone when nothing changed, so asset watchers stay quiet.
             if std::fs::read(to).ok().as_deref() != Some(&out[..]) {
-                std::fs::write(to, out).map_err(|e| format!("{}: {e}", to.display()))?;
+                pixelle_core::folder::write_atomic(to, &out).map_err(|e| format!("{}: {e}", to.display()))?;
             }
         }
         let out_dir = std::env::var_os("OUT_DIR").ok_or("OUT_DIR is not set: call this from build.rs")?;

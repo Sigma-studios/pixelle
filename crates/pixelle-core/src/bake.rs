@@ -1,10 +1,10 @@
-//! The baked runtime file (`.pxlb`): what a game ships instead of the project.
+//! Baking: what a game draws from, and the `.pxlb` file a web build ships instead of the project.
 //!
-//! A project carries everything an artist needs — mockups, sketches, the whole canvas, terrain
-//! rules. A game needs far less: the exported frames packed into one indexed atlas, the palette,
-//! and the names, anchors, timings and recolour slots that go with them. Baking keeps exactly
-//! that, so a release build downloads a file about the size of the PNGs it replaces, and loading
-//! it is a decompress and a palette lookup rather than a composite of the canvas.
+//! A project carries everything an artist needs — sketches, layers, terrain rules, pixels as
+//! text. A game needs far less: the exported frames packed into one indexed atlas, the palette,
+//! and the names, anchors, timings and recolour slots that go with them. A game reading the
+//! project folder bakes it as it loads; a web build bakes it ahead of time into one compressed
+//! file about the size of the PNGs it replaces.
 //!
 //! ```text
 //! b"PXLB"  magic
@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::format;
+use crate::folder::ProjectDir;
 use crate::geom::{IRect, IVec2};
 use crate::pack;
 use crate::palette::{Rgba, Section};
@@ -30,8 +30,31 @@ use crate::sprite::{Frame, Sprite};
 use crate::tiles::{Choice, QuarterRule, Rule, Terrain};
 
 pub const MAGIC: &[u8; 4] = b"PXLB";
-/// 2: terrains. Baked files are derived, so an older one is rebuilt rather than read.
-pub const VERSION: u16 = 2;
+/// 2: terrains. 3: quarter rules for one corner. Baked files are derived, so an older one is
+/// rebuilt rather than read.
+pub const VERSION: u16 = 3;
+
+#[derive(Debug)]
+pub enum Error {
+    NotBaked,
+    UnsupportedVersion(u16),
+    /// Baked by an older version: bake it again.
+    Stale(u16),
+    Encoding(postcard::Error),
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::NotBaked => write!(f, "not a baked Pixelle file"),
+            Error::UnsupportedVersion(v) => write!(f, "baked with format version {v}, newer than this build reads ({VERSION})"),
+            Error::Stale(v) => write!(f, "baked with format version {v}; bake it again"),
+            Error::Encoding(e) => write!(f, "corrupt baked file: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
 /// Pixels of padding between frames in the atlas, edge pixels repeated into it.
 pub const GUTTER: u32 = 1;
 
@@ -198,6 +221,28 @@ impl Baked {
         Some(sec.start..sec.start + sec.len)
     }
 
+    /// A sprite's frames side by side, top-aligned, as straight RGBA: the sheet an artist would
+    /// have exported by hand.
+    pub fn sheet_rgba(&self, sprite: &str) -> Option<crate::render::RgbaImage> {
+        let s = self.sprite(sprite)?;
+        let w = s.frames.iter().map(|f| f.rect.w).sum();
+        let h = s.frames.iter().map(|f| f.rect.h).max().unwrap_or(0);
+        let mut out = crate::render::RgbaImage::new(w, h);
+        let mut x0 = 0;
+        for f in &s.frames {
+            for y in 0..f.rect.h {
+                for x in 0..f.rect.w {
+                    let v = self.atlas[((f.rect.y as u32 + y) * self.atlas_width + f.rect.x as u32 + x) as usize];
+                    let c = self.palette.get(v as usize).copied().unwrap_or([0; 4]);
+                    let at = (((y * w) + x0 + x) * 4) as usize;
+                    out.px[at..at + 4].copy_from_slice(&c);
+                }
+            }
+            x0 += f.rect.w;
+        }
+        Some(out)
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(MAGIC);
@@ -207,18 +252,18 @@ impl Baked {
         out
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Result<Baked, format::Error> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Baked, Error> {
         if bytes.len() < 10 || &bytes[..4] != MAGIC {
-            return Err(format::Error::NotPixelle);
+            return Err(Error::NotBaked);
         }
         let version = u16::from_le_bytes([bytes[4], bytes[5]]);
         if version > VERSION {
-            return Err(format::Error::UnsupportedVersion(version));
+            return Err(Error::UnsupportedVersion(version));
         }
         if version < VERSION {
-            return Err(format::Error::Stale(version));
+            return Err(Error::Stale(version));
         }
-        postcard::from_bytes(&bytes[10..]).map_err(format::Error::Encoding)
+        postcard::from_bytes(&bytes[10..]).map_err(Error::Encoding)
     }
 }
 
@@ -316,13 +361,9 @@ pub fn bake(project: &Project) -> Baked {
     }
 }
 
-/// Read either kind of file: a project is baked on the spot, a baked file is decoded.
-pub fn load_any(bytes: &[u8]) -> Result<Baked, format::Error> {
-    if bytes.starts_with(MAGIC) {
-        Baked::from_bytes(bytes)
-    } else {
-        Ok(bake(&format::load(bytes)?))
-    }
+/// Bake a project folder.
+pub fn bake_folder(project: &ProjectDir) -> Baked {
+    bake(&project.to_canvas())
 }
 
 mod deflated {
@@ -396,7 +437,6 @@ mod tests {
         assert_eq!(f.rects["r"], IRect::new(0, 1, 1, 2));
         let back = Baked::from_bytes(&baked.to_bytes()).unwrap();
         assert_eq!(back, baked);
-        assert_eq!(load_any(&format::save(&p).unwrap()).unwrap(), baked);
     }
 }
 
@@ -426,7 +466,7 @@ mod terrain_tests {
             }
         }
         let art = p.add_layer("art", LayerKind::Pixels(g));
-        p.tilesets.push(Tileset { name: "w".into(), origin: IVec2::ZERO, tile_size: 8, columns: 7, count: 7, layers: vec![art] });
+        p.tilesets.push(Tileset { name: "w".into(), origin: IVec2::ZERO, tile_size: 8, columns: 7, count: 7, layers: vec![art], gap: 0 });
         let roles = presets::MinimalD4 { corner: 0, edge: 1, strip_end: 2, strip: 3, interior: 4, inside: 5, double_inside: 6 };
         let mut t = Terrain::new("walls", "w", presets::minimal_d4(roles));
         t.quarters = presets::quarters_d4(roles);

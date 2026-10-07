@@ -5,12 +5,13 @@ use std::collections::HashMap;
 use eframe::egui::{
     self, Align2, Color32, FontId, Key, Painter, PointerButton, Pos2, Rect, Sense, Stroke, StrokeKind, pos2, vec2,
 };
-use pixelle_core::layer::{Instance, LayerKind};
+use pixelle_core::layer::LayerKind;
 use pixelle_core::render::Renderer;
-use pixelle_core::{D4, Frame, IRect, IVec2, LayerId, Sprite};
+use pixelle_core::{IRect, IVec2, LayerId, Sprite};
 
 use crate::app::{Drag, Editor, Floating, Selected};
 use crate::tools::{self, Tool};
+use crate::workspace::{self, TabKind};
 
 const MINIMAP: egui::Vec2 = vec2(200.0, 130.0);
 const HANDLE: f32 = 7.0;
@@ -21,7 +22,7 @@ impl Editor {
         self.canvas_rect = rect;
         if self.fit_pending {
             self.fit_pending = false;
-            let r = self.pending_fit_rect.take().unwrap_or_else(|| self.doc.project.bounds());
+            let r = self.pending_fit_rect.take().unwrap_or_else(|| self.doc.project.bounds_where(|l| l.visible));
             if r.is_empty() {
                 self.view.center = egui::Vec2::ZERO;
                 self.view.zoom = 8.0;
@@ -182,50 +183,13 @@ impl Editor {
                 {
                     let corner = self.view.to_screen(self.canvas_rect, pos2(r.max().x as f32, r.max().y as f32));
                     if (corner - pos).length() < HANDLE * 1.5 {
-                        return Some(Drag::ResizeFrame { name, frame, orig: r });
+                        return Some(Drag::ResizeFrame { frame, orig: r });
                     }
                 }
-                match self.frame_at(px) {
-                    Some((name, frame, r)) => {
-                        self.select_sprite(&name, frame);
-                        Some(Drag::MoveFrame { name, frame, grab: px, orig: r })
-                    }
-                    None => {
-                        self.free_drag = mods.alt;
-                        Some(Drag::NewSprite { start: px })
-                    }
+                if let Some((name, frame, _)) = self.frame_at(px) {
+                    self.select_sprite(&name, frame);
                 }
-            }
-            Tool::Instance => {
-                let layer = self.active_layer?;
-                if !matches!(self.doc.project.layer(layer).map(|l| &l.kind), Some(LayerKind::Instances(_))) {
-                    self.say("Pick an instance layer");
-                    return None;
-                }
-                if let Some(index) = self.instance_at(layer, px) {
-                    self.selected = Selected::Instance { layer, index };
-                    let orig = self.instance(layer, index).map_or(px, |i| i.pos);
-                    return Some(Drag::MoveInstance { layer, index, grab: px, orig });
-                }
-                let Some(sprite) = self.last_sprite.clone().filter(|s| self.doc.project.sprite(s).is_some()) else {
-                    self.say("Select a sprite in the Sprites list to place it");
-                    return None;
-                };
-                let mut index = 0;
-                self.edit("Place instance", None, |p| {
-                    if let Some(LayerKind::Instances(list)) = p.layer_mut(layer).map(|l| &mut l.kind) {
-                        list.push(Instance {
-                            sprite: sprite.clone(),
-                            frame: 0,
-                            pos: px,
-                            transform: D4::IDENTITY,
-                            swaps: Vec::new(),
-                        });
-                        index = list.len() - 1;
-                    }
-                });
-                self.selected = Selected::Instance { layer, index };
-                Some(Drag::MoveInstance { layer, index, grab: px, orig: px })
+                None
             }
             Tool::Hand => Some(Drag::Pan),
         }
@@ -266,53 +230,17 @@ impl Editor {
                     self.selection = Some(IRect::new(f.pos.x, f.pos.y, f.img.w, f.img.h));
                 }
             }
-            Drag::NewSprite { .. } => {
-                self.shape_end = Some(px);
-                self.free_drag = mods.alt;
-            }
-            Drag::MoveFrame { name, frame, grab, orig } => {
-                let mut to = orig.min() + (px - grab);
-                if !mods.alt {
-                    to = self.snap(to + IVec2::splat(self.doc.project.grid as i32 / 2));
-                }
-                if to != self.frame_rect(&name, frame).map_or(to, |r| r.min()) {
-                    self.edit("Move frame", Some("move-frame"), |p| {
-                        if let Some(f) = sprite_mut(p, &name).and_then(|s| s.frames.get_mut(frame)) {
-                            f.rect.x = to.x;
-                            f.rect.y = to.y;
-                        }
-                    });
-                }
-            }
-            Drag::ResizeFrame { name, frame, orig } => {
+            Drag::ResizeFrame { frame, orig } => {
                 let mut end = px + IVec2::ONE;
                 if !mods.alt {
                     end = self.snap(end + IVec2::splat(self.doc.project.grid as i32 / 2));
                 }
                 let (w, h) = ((end.x - orig.x).max(1) as u32, (end.y - orig.y).max(1) as u32);
-                if self.frame_rect(&name, frame).is_some_and(|r| (r.w, r.h) != (w, h)) {
-                    self.edit("Resize frame", Some("resize-frame"), |p| {
-                        if let Some(f) = sprite_mut(p, &name).and_then(|s| s.frames.get_mut(frame)) {
-                            f.rect.w = w;
-                            f.rect.h = h;
-                        }
-                    });
+                let now = self.doc.project.sprites.first().and_then(|s| s.frames.get(frame)).map(|f| (f.rect.w, f.rect.h));
+                if now.is_some_and(|n| n != (w, h)) {
+                    self.edit_sprite("Resize frame", Some("resize-frame"), |s| workspace::resize_frame(&mut s.frames[frame], w, h));
                 }
-            }
-            Drag::MoveInstance { layer, index, grab, orig } => {
-                let mut to = orig + (px - grab);
-                if mods.shift {
-                    to = self.snap(to + IVec2::splat(self.doc.project.grid as i32 / 2));
-                }
-                if self.instance(layer, index).is_some_and(|i| i.pos != to) {
-                    self.edit("Move instance", Some("move-instance"), |p| {
-                        if let Some(LayerKind::Instances(list)) = p.layer_mut(layer).map(|l| &mut l.kind)
-                            && let Some(i) = list.get_mut(index)
-                        {
-                            i.pos = to;
-                        }
-                    });
-                }
+                self.drag = Some(Drag::ResizeFrame { frame, orig });
             }
             Drag::Terrain { value, last } => {
                 let size = self.active_layer.and_then(|l| match &self.doc.project.layer(l)?.kind {
@@ -351,26 +279,6 @@ impl Editor {
                 if start == px && self.selection.is_some_and(|s| s.w == 1 && s.h == 1) => {
                     self.selection = None;
                 }
-            Drag::NewSprite { start } => {
-                let Some(end) = self.shape_end.take() else {
-                    // A click on nothing: deselect.
-                    self.selected = Selected::None;
-                    return;
-                };
-                let r = self.new_sprite_rect(start, end);
-                let layer = self.pixel_layer().or_else(|| {
-                    self.doc.project.layers.iter().find(|l| l.pixels().is_some() && !l.reference).map(|l| l.id)
-                });
-                let Some(layer) = layer else {
-                    self.say("A sprite needs a pixel layer to export");
-                    return;
-                };
-                let name = unique_name(&self.doc.project, "sprite");
-                let n = name.clone();
-                self.edit("New sprite", None, |p| p.sprites.push(Sprite::new(n, vec![layer], vec![Frame::new(r)])));
-                self.select_sprite(&name, 0);
-                self.say(format!("Made {name}; rename it in the inspector"));
-            }
             _ => {}
         }
         self.shape_end = None;
@@ -391,17 +299,6 @@ impl Editor {
         if let Some(m) = mirror {
             self.doc.set(mirrored(p, m), value);
         }
-    }
-
-    /// The rectangle a new-sprite drag covers: every grid cell it touches, or exactly the pixels
-    /// between its ends when dragging off-grid.
-    fn new_sprite_rect(&self, a: IVec2, b: IVec2) -> IRect {
-        if self.free_drag {
-            return tools::span(a, b);
-        }
-        let g = self.doc.project.grid.max(1) as i32;
-        let (lo, hi) = (a.min(b), a.max(b));
-        IRect::from_min_max(self.snap(lo), self.snap(hi) + IVec2::splat(g))
     }
 
     pub fn snap(&self, p: IVec2) -> IVec2 {
@@ -462,31 +359,8 @@ impl Editor {
         })
     }
 
-    fn frame_rect(&self, name: &str, frame: usize) -> Option<IRect> {
-        self.doc.project.sprite(name)?.frames.get(frame).map(|f| f.rect)
-    }
-
-    pub fn instance(&self, layer: LayerId, index: usize) -> Option<&Instance> {
-        match &self.doc.project.layer(layer)?.kind {
-            LayerKind::Instances(list) => list.get(index),
-            _ => None,
-        }
-    }
-
-    fn instance_rect(&self, i: &Instance) -> Option<IRect> {
-        let f = self.doc.project.sprite(&i.sprite)?.frames.get(i.frame as usize)?;
-        let (w, h) = i.transform.size(f.size().0, f.size().1);
-        Some(IRect::new(i.pos.x, i.pos.y, w, h))
-    }
-
-    fn instance_at(&self, layer: LayerId, px: IVec2) -> Option<usize> {
-        let LayerKind::Instances(list) = &self.doc.project.layer(layer)?.kind else { return None };
-        (0..list.len()).rev().find(|&i| self.instance_rect(&list[i]).is_some_and(|r| r.contains(px)))
-    }
-
     pub fn select_sprite(&mut self, name: &str, frame: usize) {
         self.selected = Selected::Sprite { name: name.to_string(), frame };
-        self.last_sprite = Some(name.to_string());
     }
 
     // --- Minimap -------------------------------------------------------------------------------
@@ -497,7 +371,7 @@ impl Editor {
 
     /// Where the minimap draws the project: its bounds scaled to fit, centred.
     fn minimap_mapping(&self, screen: Rect) -> Option<(IRect, Rect)> {
-        let b = self.doc.project.bounds();
+        let b = self.doc.project.bounds_where(|l| l.visible);
         if b.is_empty() {
             return None;
         }
@@ -561,26 +435,31 @@ impl Editor {
             ctx.request_repaint();
         }
 
-        // Tilesets, when working with terrain.
-        let terrain_mode = self.tool == Tool::Terrain
-            || self.active_layer.and_then(|l| self.doc.project.layer(l)).is_some_and(|l| matches!(l.kind, LayerKind::Terrain(_)));
-        if terrain_mode {
-            for ts in &self.doc.project.tilesets {
-                let r = self.view.rect_to_screen(screen, ts.bounds());
-                painter.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::from_rgb(90, 200, 255)), StrokeKind::Outside);
-                painter.text(r.left_top() - vec2(0.0, 2.0), Align2::LEFT_BOTTOM, format!("tileset {}", ts.name), FontId::proportional(11.0), Color32::from_rgb(90, 200, 255));
+        // A terrain's tiles, by name.
+        if let TabKind::Terrain(name) = self.kind().clone()
+            && let Some(t) = self.project.terrains.get(&name)
+            && let Some(ts) = self.doc.project.tilesets.first()
+        {
+            let slots = t.preset.two_surface().slots;
+            let col = Color32::from_rgb(90, 200, 255);
+            for (i, slot) in slots.iter().enumerate() {
+                let r = self.view.rect_to_screen(screen, ts.tile_rect(i as u32));
+                painter.rect_stroke(r, 0.0, Stroke::new(1.0, col.gamma_multiply(0.6)), StrokeKind::Outside);
+                if r.width() >= 40.0 {
+                    painter.text(r.left_top() - vec2(0.0, 2.0), Align2::LEFT_BOTTOM, &slot.name, FontId::proportional(10.0), col);
+                }
+            }
+            if let Some(patch) = workspace::patch_rect(&self.doc.project) {
+                let s = ts.tile_size as i32;
+                let px = IRect::new(patch.x * s, patch.y * s, patch.w * s as u32, patch.h * s as u32);
+                let r = self.view.rect_to_screen(screen, px);
+                painter.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::from_white_alpha(40)), StrokeKind::Outside);
+                painter.text(r.left_top() - vec2(0.0, 2.0), Align2::LEFT_BOTTOM, "ground to try them on (T paints, right button erases)", FontId::proportional(11.0), Color32::from_white_alpha(140));
             }
         }
 
         // Sprites, their animation previews and anchors.
         self.sprite_overlays(ctx, painter, screen, vis, hover);
-
-        // Instances.
-        if let Selected::Instance { layer, index } = self.selected
-            && let Some(r) = self.instance(layer, index).and_then(|i| self.instance_rect(i))
-        {
-            painter.rect_stroke(self.view.rect_to_screen(screen, r), 0.0, Stroke::new(2.0, Color32::from_rgb(120, 255, 160)), StrokeKind::Outside);
-        }
 
         // Floating pixels and the selection.
         if let Some(f) = &self.floating {
@@ -616,11 +495,6 @@ impl Editor {
                 for p in pixels {
                     painter.rect_filled(self.view.rect_to_screen(screen, IRect::new(p.x, p.y, 1, 1)), 0.0, c);
                 }
-            }
-            (Some(Drag::NewSprite { start }), Some(end)) => {
-                let r = self.new_sprite_rect(*start, end);
-                painter.rect_stroke(self.view.rect_to_screen(screen, r), 0.0, Stroke::new(2.0, Color32::YELLOW), StrokeKind::Outside);
-                painter.text(to(r.min()) - vec2(0.0, 2.0), Align2::LEFT_BOTTOM, format!("{}×{}", r.w, r.h), FontId::proportional(12.0), Color32::YELLOW);
             }
             _ => {}
         }
@@ -792,10 +666,6 @@ impl Editor {
         )
         .intersect(frame);
         painter.rect_stroke(v, 0.0, Stroke::new(1.0, Color32::WHITE), StrokeKind::Inside);
-        for bm in &self.doc.project.bookmarks {
-            let br = Rect::from_min_size(r.min + vec2((bm.rect.x - b.x) as f32 * k, (bm.rect.y - b.y) as f32 * k), vec2(bm.rect.w as f32 * k, bm.rect.h as f32 * k));
-            painter.text(br.left_top(), Align2::LEFT_TOP, &bm.name, FontId::proportional(9.0), Color32::from_white_alpha(150));
-        }
     }
 }
 
@@ -812,28 +682,16 @@ pub fn sprite_mut<'a>(p: &'a mut pixelle_core::Project, name: &str) -> Option<&'
     p.sprites.iter_mut().find(|s| s.name == name)
 }
 
-pub fn unique_name(p: &pixelle_core::Project, base: &str) -> String {
-    (1..).map(|i| format!("{base}_{i}")).find(|n| p.sprite(n).is_none()).expect("names are unbounded")
-}
-
 /// The tools, driven the way the pointer drives them.
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::app::Args;
+    use pixelle_core::D4;
     use egui::Modifiers;
 
     fn editor() -> Editor {
-        let mut ed = Editor::new(Args {
-            file: None,
-            screenshot: None,
-            view: None,
-            zoom: None,
-            select: None,
-            tool: None,
-            layer: None,
-        })
-        .unwrap();
+        let mut ed = Editor::new(Args { project: None, remember: false, screenshot: None, open: None, zoom: None, tool: None, layer: None }).unwrap();
         ed.canvas_rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
         ed.view.center = vec2(0.0, 0.0);
         ed.view.zoom = 4.0;
@@ -971,38 +829,95 @@ mod tests {
         assert_eq!(ed.doc.get(l, IVec2::new(4, 4)), 0);
     }
 
+    fn sprite_tab(ed: &mut Editor) {
+        ed.new_file("hero", pixelle_core::folder::File::Sprite(pixelle_core::SpriteFile::new(8, 8))).unwrap();
+        assert_eq!(ed.kind(), &TabKind::Sprite("hero".into()));
+    }
+
     #[test]
-    fn sprites_are_made_on_the_grid_and_moved_and_resized() {
+    fn a_sprite_paints_inside_its_frames_only() {
         let mut ed = editor();
-        ed.tool = Tool::Sprite;
-        drag(&mut ed, &[(2, 1), (12, 3)], PointerButton::Primary, Modifiers::NONE);
-        let s = ed.doc.project.sprites.last().unwrap().clone();
-        assert_eq!(s.frames[0].rect, IRect::new(0, 0, 16, 8));
-        assert!(matches!(&ed.selected, Selected::Sprite { name, .. } if *name == s.name));
-        // Drag it a cell right.
-        drag(&mut ed, &[(3, 3), (11, 3)], PointerButton::Primary, Modifiers::NONE);
-        assert_eq!(ed.doc.project.sprite(&s.name).unwrap().frames[0].rect.x, 8);
-        // Resize from the corner.
-        let name = s.name.clone();
-        ed.drag = Some(Drag::ResizeFrame { name: name.clone(), frame: 0, orig: IRect::new(8, 0, 16, 8) });
-        let d = ed.drag.clone().unwrap();
-        ed.drag_to(d, IVec2::new(15, 14), Modifiers::NONE);
-        assert_eq!(ed.doc.project.sprite(&name).unwrap().frames[0].rect, IRect::new(8, 0, 8, 16));
-        // The move and the resize were one undo step each, however many pointer moves they took.
+        sprite_tab(&mut ed);
+        ed.tool = Tool::Line;
+        ed.primary = 3;
+        drag(&mut ed, &[(0, 0), (20, 0)], PointerButton::Primary, Modifiers::NONE);
+        let l = art(&ed);
+        assert_eq!(ed.doc.get(l, IVec2::new(7, 0)), 3);
+        assert_eq!(ed.doc.get(l, IVec2::new(8, 0)), 0, "outside the frame belongs to no file");
+        ed.write_back_all();
+        assert_eq!(ed.project.sprites["hero"].frames[0].pixels["art"].get(7, 0), 3);
+    }
+
+    #[test]
+    fn frames_resize_from_the_corner_as_one_step() {
+        let mut ed = editor();
+        sprite_tab(&mut ed);
+        ed.tool = Tool::Pencil;
+        ed.primary = 2;
+        click(&mut ed, 1, 1);
+        ed.drag = Some(Drag::ResizeFrame { frame: 0, orig: IRect::new(0, 0, 8, 8) });
+        for p in [IVec2::new(11, 11), IVec2::new(15, 7)] {
+            let d = ed.drag.clone().unwrap();
+            ed.drag_to(d, p, Modifiers::NONE);
+        }
+        let f = ed.doc.project.sprites[0].frames[0].rect;
+        assert_eq!((f.w, f.h), (16, 8));
+        assert_eq!(ed.doc.get(art(&ed), IVec2::new(1, 1)), 2, "the pixels stay put");
         ed.undo();
-        assert_eq!(ed.doc.project.sprite(&name).unwrap().frames[0].rect, IRect::new(8, 0, 16, 8));
+        let f = ed.doc.project.sprites[0].frames[0].rect;
+        assert_eq!((f.w, f.h), (8, 8));
     }
 
     #[test]
     fn points_are_placed_by_clicking_in_the_frame() {
         let mut ed = editor();
-        ed.tool = Tool::Sprite;
-        drag(&mut ed, &[(0, 0), (7, 7)], PointerButton::Primary, Modifiers::NONE);
+        sprite_tab(&mut ed);
         ed.placing_point = Some("muzzle".into());
         click(&mut ed, 6, 3);
-        let Selected::Sprite { name, .. } = ed.selected.clone() else { panic!() };
-        assert_eq!(ed.doc.project.sprite(&name).unwrap().frames[0].points["muzzle"], IVec2::new(6, 3));
+        assert_eq!(ed.doc.project.sprites[0].frames[0].points["muzzle"], IVec2::new(6, 3));
         assert!(ed.placing_point.is_none());
+    }
+
+    #[test]
+    fn saving_writes_the_project_folder_and_reopens_it() {
+        let dir = std::env::temp_dir().join(format!("pixelle-editor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut ed = editor();
+        ed.open_project(&dir).unwrap();
+        sprite_tab(&mut ed);
+        ed.tool = Tool::Pencil;
+        ed.primary = 4;
+        click(&mut ed, 2, 2);
+        assert!(ed.any_unsaved());
+        ed.save();
+        assert!(!ed.any_unsaved());
+        let back = pixelle_core::ProjectDir::load(&dir).unwrap();
+        assert_eq!(back.sprites["hero"].frames[0].pixels["art"].get(2, 2), 4);
+        // Renaming and deleting take effect on disk at the next save.
+        ed.rename("hero", "chars/hero").unwrap();
+        ed.save();
+        assert!(dir.join("chars/hero.pxl").exists());
+        assert!(!dir.join("hero.pxl").exists());
+        ed.delete("chars/hero");
+        ed.save();
+        assert!(!dir.join("chars/hero.pxl").exists());
+        assert!(pixelle_core::ProjectDir::load(&dir).unwrap().sprites.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn tabs_keep_their_own_canvas_and_history() {
+        let mut ed = editor();
+        sprite_tab(&mut ed);
+        ed.tool = Tool::Pencil;
+        ed.primary = 5;
+        click(&mut ed, 0, 0);
+        ed.activate(0);
+        assert_eq!(ed.kind(), &TabKind::Sandbox);
+        assert!(ed.doc.can_undo().is_none());
+        ed.activate(1);
+        assert_eq!(ed.doc.can_undo(), Some("Pencil"));
+        assert_eq!(ed.doc.get(art(&ed), IVec2::ZERO), 5);
     }
 
     #[test]
@@ -1024,39 +939,22 @@ mod tests {
     }
 
     #[test]
-    fn instances_are_placed_moved_and_flipped() {
+    fn colours_inserted_mid_palette_keep_the_art_of_every_file() {
         let mut ed = editor();
-        let l = art(&ed);
-        ed.edit("sprite", None, |p| p.sprites.push(Sprite::new("s", vec![l], vec![Frame::new(IRect::new(0, 0, 8, 8))])));
-        let mut id = 0;
-        ed.edit("layer", None, |p| id = p.add_layer("Actors", LayerKind::Instances(Vec::new())));
-        ed.active_layer = Some(id);
-        ed.select_sprite("s", 0);
-        ed.tool = Tool::Instance;
-        click(&mut ed, 20, 20);
-        assert_eq!(ed.instance(id, 0).unwrap().pos, IVec2::new(20, 20));
-        drag(&mut ed, &[(21, 21), (31, 26)], PointerButton::Primary, Modifiers::NONE);
-        assert_eq!(ed.instance(id, 0).unwrap().pos, IVec2::new(30, 25));
-        ed.delete_selection();
-        assert!(ed.instance(id, 0).is_none());
-    }
-
-    #[test]
-    fn colours_inserted_mid_palette_keep_the_art() {
-        let mut ed = editor();
-        let l = art(&ed);
+        sprite_tab(&mut ed);
         ed.tool = Tool::Pencil;
         ed.primary = 20;
         click(&mut ed, 0, 0);
         let before = ed.doc.project.palette.rgba(20);
-        ed.edit("section", None, |p| {
-            p.palette.begin_section("B");
-            p.palette.push("b", [1, 2, 3, 255]).unwrap();
-        });
-        ed.edit("insert", None, |p| {
-            p.insert_color(0, "new", [9, 9, 9, 255]).unwrap();
-        });
-        let v = ed.doc.get(l, IVec2::ZERO);
+        ed.add_palette_section("B", &[("b".into(), [1, 2, 3, 255])]);
+        ed.activate(0);
+        ed.insert_color(0, "new", [9, 9, 9, 255]).unwrap();
+        ed.activate(1);
+        let v = ed.doc.get(art(&ed), IVec2::ZERO);
         assert_eq!(ed.doc.project.palette.rgba(v), before);
+        assert_eq!(ed.project.palette, ed.doc.project.palette);
+        // The insert is one step of its own.
+        ed.undo();
+        assert_eq!(ed.doc.get(art(&ed), IVec2::ZERO), 20);
     }
 }

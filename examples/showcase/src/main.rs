@@ -1,13 +1,13 @@
-//! run-2d's art, straight from `run2d.pxl`.
+//! run-2d's art, straight from the project folder `assets/run2d`.
 //!
-//! Everything here is looked up by name through the generated `art` module — no frame indices,
-//! no pixel constants. Weapons sit in hands by the file's own `hand` and `trigger` points; players
-//! are recoloured through its recolour slots; a grid map is autotiled by its walls terrain.
+//! Everything here is looked up by name through the generated `art` module — sprites, and the
+//! frames of a sheet by their names, no pixel constants. Weapons sit in hands by the project's own
+//! `hand` and `trigger` points; players are recoloured through its recolour slots; a grid map is
+//! autotiled by its walls terrain.
 //!
-//! `cargo run -p showcase` loads the project (edit it in the editor and it reloads);
-//! `cargo run -p showcase --release` loads the baked `run2d.pxlb`.
-//! `PIXELLE_FILE=run2d.pxlb` picks the file; `PIXELLE_SCREENSHOT=out.png` saves a screenshot and
-//! quits.
+//! `cargo run -p showcase` loads the folder; edit any file in it in the editor and it reloads.
+//! `PIXELLE_FILE=run2d.pxlb` loads the baked file a web build would; `PIXELLE_SCREENSHOT=out.png`
+//! saves a screenshot and quits.
 
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
@@ -36,7 +36,7 @@ fn main() {
         )
         .add_plugins(PixellePlugin)
         .add_systems(Startup, setup)
-        .add_systems(Update, (populate, seat_held.after(PixelleSystems), screenshot))
+        .add_systems(Update, (populate, cycle.before(PixelleSystems), seat_held.after(PixelleSystems), screenshot))
         .run();
 }
 
@@ -51,7 +51,7 @@ struct Held {
 
 fn setup(mut commands: Commands, assets: Res<AssetServer>) {
     let file = std::env::var("PIXELLE_FILE")
-        .unwrap_or_else(|_| if cfg!(debug_assertions) { "run2d.pxl" } else { "run2d.pxlb" }.into());
+        .unwrap_or_else(|_| if cfg!(target_arch = "wasm32") { "run2d.pxlb" } else { "run2d/project.pxl" }.into());
     commands.insert_resource(Art(assets.load(file)));
     commands.spawn((
         Camera2d,
@@ -81,8 +81,8 @@ fn populate(mut commands: Commands, art: Res<Art>, arts: Res<Assets<PixelleArt>>
         let hair = clothing.start + (i as u8 * 5) % clothing.len() as u8;
         let skin = skins.start + i as u8 % skins.len() as u8;
         commands.spawn((
-            sprite(art::player::POSES)
-                .frame(art::player::poses::IDLE)
+            sprite(art::PLAYER)
+                .frame(art::player::IDLE)
                 .swap(art::swaps::SHIRT, shirt)
                 .swap(art::swaps::HAIR, hair)
                 .swap(art::swaps::SKIN, skin),
@@ -90,35 +90,37 @@ fn populate(mut commands: Commands, art: Res<Art>, arts: Res<Assets<PixelleArt>>
         ));
     }
 
-    // Runners and posers, each holding something by the file's anchors.
+    // Runners and posers, each holding something by the project's anchors. The two-frame cycles
+    // flip between their frames of the sheet, as run-2d does.
+    use art::{player as pose, weapons as weapon};
     let armed = [
-        (art::player::RUN, art::weapons::SHOTGUN, false, palette::clothing::RUST),
-        (art::player::JUMP_ARMED, art::weapons::ROCKET_LAUNCHER, false, palette::clothing::GREEN),
-        (art::player::CROUCH_WALK, art::weapons::GRENADE_LAUNCHER, true, palette::clothing::PURPLE),
-        (art::player::WALL_SLIDE_ARMED, art::weapons::NET_GUN, true, palette::clothing::YELLOW),
-        (art::player::IDLE, art::weapons::SWORD, false, palette::clothing::CYAN),
-        (art::player::IDLE, art::weapons::FLAG_RED, false, palette::clothing::FLAG_RED),
-        (art::player::SLIDE, art::weapons::HANDGUN, false, palette::clothing::PINK),
-        (art::player::IDLE, art::weapons::FLAG_BLUE, true, palette::clothing::NAVY),
+        ([pose::RUN_1, pose::RUN_2], weapon::SHOTGUN, false, palette::clothing::RUST),
+        ([pose::JUMP_ARMED; 2], weapon::ROCKET_LAUNCHER, false, palette::clothing::GREEN),
+        ([pose::CROUCH, pose::CROUCH_WALK], weapon::GRENADE_LAUNCHER, true, palette::clothing::PURPLE),
+        ([pose::WALL_SLIDE_ARMED; 2], weapon::NET_GUN, true, palette::clothing::YELLOW),
+        ([pose::IDLE; 2], weapon::SWORD, false, palette::clothing::CYAN),
+        ([pose::IDLE; 2], weapon::FLAG_RED, false, palette::clothing::FLAG_RED),
+        ([pose::SLIDE; 2], weapon::HANDGUN, false, palette::clothing::PINK),
+        ([pose::IDLE; 2], weapon::FLAG_BLUE, true, palette::clothing::NAVY),
     ];
-    for (i, (pose, weapon, left, shirt)) in armed.into_iter().enumerate() {
-        let mut body = commands.spawn((
-            sprite(pose).swap(art::swaps::SHIRT, shirt).flipped_x(left),
-            at(-84.0 + i as f32 * 24.0, 14.0, 0.0),
-        ));
-        if a.sprite(pose).is_some_and(|s| s.is_animation()) {
-            body.insert(PixelleAnimation::looping());
-        }
-        let by = body.id();
-        commands.spawn((sprite(weapon).flipped_x(left), Held { by }, at(0.0, 0.0, 0.5)));
+    for (i, (frames, held, left, shirt)) in armed.into_iter().enumerate() {
+        let by = commands
+            .spawn((
+                sprite(art::PLAYER).frame(frames[0]).swap(art::swaps::SHIRT, shirt).flipped_x(left),
+                Cycle(frames),
+                at(-84.0 + i as f32 * 24.0, 14.0, 0.0),
+            ))
+            .id();
+        commands.spawn((sprite(art::WEAPONS).frame(held).flipped_x(left), Held { by }, at(0.0, 0.0, 0.5)));
     }
 
-    // Things that play.
-    for (name, x, y) in [(art::fx::EXPLOSION, 104.0, -22.0), (art::weapons::ROCKET, -30.0, -18.0), (art::weapons::SHELL, -10.0, -18.0)] {
-        commands.spawn((sprite(name), PixelleAnimation::looping(), at(x, y, 1.0)));
+    // Things that play: a sprite that is an animation, and two-frame cycles of a sheet.
+    commands.spawn((sprite(art::fx::EXPLOSION), PixelleAnimation::looping(), at(104.0, -22.0, 1.0)));
+    for (frames, x) in [([weapon::ROCKET_1, weapon::ROCKET_2], -30.0), ([weapon::SHELL_1, weapon::SHELL_2], -10.0)] {
+        commands.spawn((sprite(art::WEAPONS).frame(frames[0]), Cycle(frames), at(x, -18.0, 1.0)));
     }
-    for (i, e) in [art::emotes::CRY, art::emotes::ANGRY, art::emotes::LAUGH, art::emotes::COOL].into_iter().enumerate() {
-        commands.spawn((sprite(e), at(20.0 + i as f32 * 12.0, -18.0, 0.0)));
+    for i in 0..a.sprite(art::EMOTES).map_or(0, |s| s.len()) {
+        commands.spawn((sprite(art::EMOTES).frame(i), at(20.0 + i as f32 * 12.0, -18.0, 0.0)));
     }
 
     // A grid map, clad at run time by the file's walls terrain — whole frames where they fit,
@@ -150,25 +152,30 @@ fn populate(mut commands: Commands, art: Res<Art>, arts: Res<Assets<PixelleArt>>
         }
     }
     // A girder, and what stands on the ground.
-    use art::platforms::sheet as p;
+    use art::{platforms as p, props};
     for (i, f) in [p::CAP_LEFT, p::MIDDLE, p::MIDDLE, p::MIDDLE, p::CAP_RIGHT].into_iter().enumerate() {
-        commands.spawn((sprite(art::platforms::SHEET).frame(f), at(-20.0 + i as f32 * 8.0, -58.0, -0.9)));
+        commands.spawn((sprite(art::PLATFORMS).frame(f), at(-20.0 + i as f32 * 8.0, -58.0, -0.9)));
     }
-    for (i, (name, f)) in [
-        (art::props::WEAPON_MARK, 0),
-        (art::props::JUMP_PAD, 0),
-        (art::props::JUMP_PAD, 1),
-        (art::props::SPIKES, 0),
-        (art::props::SPIKES, 0),
-        (art::props::FLAG_PAD_RED, 0),
-        (art::props::FLAG_PAD_BLUE, 0),
-    ]
-    .into_iter()
-    .enumerate()
+    for (i, f) in [props::WEAPON_MARK, props::JUMP_PAD_REST, props::JUMP_PAD_SPRUNG, props::SPIKES, props::SPIKES, props::PORTAL_SINGLE]
+        .into_iter()
+        .enumerate()
     {
-        commands.spawn((sprite(name).frame(f), at(40.0 + i as f32 * 9.0, -58.0, -0.5)));
+        commands.spawn((sprite(art::PROPS).frame(f), at(40.0 + i as f32 * 9.0, -58.0, -0.5)));
     }
-    commands.spawn((sprite(art::weapons::BULLET), at(80.0, 14.0, 0.5)));
+    commands.spawn((sprite(art::fx::BULLET), at(80.0, 14.0, 0.5)));
+}
+
+/// Two frames of a sheet, swapped every 0.11 s: `player.rs` `RUN_FRAME_TIME`.
+#[derive(Component)]
+struct Cycle([usize; 2]);
+
+fn cycle(time: Res<Time>, mut q: Query<(&Cycle, &mut PixelleSprite)>) {
+    let phase = (time.elapsed_secs() / 0.11) as usize % 2;
+    for (c, mut ps) in &mut q {
+        if ps.frame != c.0[phase] {
+            ps.frame = c.0[phase];
+        }
+    }
 }
 
 /// Put each held thing in its holder's hand: the holder's `hand` point on the thing's `trigger`,

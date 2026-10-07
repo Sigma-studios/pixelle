@@ -1,14 +1,15 @@
 //! Pixelle art in Bevy.
 //!
-//! Load a project (`.pxl`) while developing, so saving in the editor hot-reloads the game, and the
-//! baked file (`.pxlb`) in release builds; both give the same [`PixelleArt`]. Refer to sprites by
+//! Load a project straight from its folder — `art/project.pxl`, which brings every file it lists
+//! along, so saving any of them in the editor hot-reloads the game — or, on the web, the baked
+//! file `pixelle-build` writes (`.pxlb`); both give the same [`PixelleArt`]. Refer to sprites by
 //! the typed constants `pixelle-build` generates, and let [`PixelleSprite`] keep entities drawing
 //! the right frame — through hot reloads, animations and recolouring.
 //!
 //! ```ignore
 //! app.add_plugins(PixellePlugin);
 //!
-//! let art: Handle<PixelleArt> = assets.load(if cfg!(debug_assertions) { "art.pxl" } else { "art.pxlb" });
+//! let art: Handle<PixelleArt> = assets.load(if cfg!(target_arch = "wasm32") { "art.pxlb" } else { "art/project.pxl" });
 //! commands.spawn((
 //!     PixelleSprite::new(art.clone(), art::player::POSES)
 //!         .frame(art::player::poses::IDLE)
@@ -20,6 +21,10 @@
 //!
 //! Anchor points come back in the convention sprites are placed by — from the frame's centre, `y`
 //! up — see [`FrameRef::offset`].
+//!
+//! Code that cuts its own rectangles out of sheet images can keep doing so: every sprite is also an
+//! image of its frames side by side, labelled `sheet/<name>` — `assets.load("art/project.pxl#sheet/player")`
+//! — laid out as a hand-exported sheet would be. See [`sheet_label`].
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -287,8 +292,19 @@ pub struct PixelleLoader;
 pub enum PixelleError {
     #[error("could not read the file: {0}")]
     Io(#[from] std::io::Error),
+    #[error("could not read {0}: {1}")]
+    Read(String, String),
     #[error("{0}")]
-    Format(#[from] pixelle_core::format::Error),
+    Project(#[from] pixelle_core::folder::Error),
+    #[error("{0}")]
+    Baked(#[from] bake::Error),
+    #[error("{0} is a {1} file; load the project's project.pxl")]
+    NotProject(String, &'static str),
+}
+
+/// The label of a sprite's sheet image: `art/project.pxl#sheet/player`.
+pub fn sheet_label(sprite: impl AsRef<str>) -> String {
+    format!("sheet/{}", sprite.as_ref())
 }
 
 impl AssetLoader for PixelleLoader {
@@ -299,7 +315,45 @@ impl AssetLoader for PixelleLoader {
     async fn load(&self, reader: &mut dyn Reader, _: &(), ctx: &mut LoadContext<'_>) -> Result<PixelleArt, PixelleError> {
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).await?;
-        let baked = bake::load_any(&bytes)?;
+        let baked = if bytes.starts_with(bake::MAGIC) {
+            Baked::from_bytes(&bytes)?
+        } else {
+            let path = ctx.path().to_string();
+            let root = pixelle_core::folder::File::from_bytes(&path, &bytes)?;
+            let pixelle_core::folder::File::Project(manifest) = root else {
+                return Err(PixelleError::NotProject(path, root.kind()));
+            };
+            // Read every file the root lists through the asset server, so each is a dependency:
+            // saving any of them reloads the whole project.
+            let mut files = HashMap::new();
+            for rel in &manifest.files {
+                let at = ctx.path().resolve_embed_str(rel).map_err(|e| PixelleError::Read(rel.clone(), e.to_string()))?;
+                let bytes = ctx.read_asset_bytes(at).await.map_err(|e| PixelleError::Read(rel.clone(), e.to_string()))?;
+                files.insert(rel.clone(), bytes);
+            }
+            let mut project = pixelle_core::ProjectDir::from_manifest(manifest.clone())?;
+            for rel in &manifest.files {
+                let file = pixelle_core::folder::File::from_bytes(rel, &files[rel])?;
+                project.insert(&pixelle_core::folder::asset_name(rel), file)?;
+            }
+            for problem in project.validate() {
+                warn!("{path}: {problem}");
+            }
+            bake::bake_folder(&project)
+        };
+        for s in &baked.sprites {
+            if let Some(sheet) = baked.sheet_rgba(&s.name) {
+                let mut image = Image::new(
+                    Extent3d { width: sheet.w.max(1), height: sheet.h.max(1), depth_or_array_layers: 1 },
+                    TextureDimension::D2,
+                    if sheet.px.is_empty() { vec![0; 4] } else { sheet.px },
+                    TextureFormat::Rgba8UnormSrgb,
+                    RenderAssetUsages::default(),
+                );
+                image.sampler = ImageSampler::nearest();
+                ctx.add_labeled_asset(sheet_label(&s.name), image);
+            }
+        }
         let image = atlas_image(&baked, baked.atlas_rgba());
         let mut layout = TextureAtlasLayout::new_empty(UVec2::new(baked.atlas_width, baked.atlas_height));
         let mut by_name = HashMap::new();

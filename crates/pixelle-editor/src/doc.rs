@@ -1,4 +1,5 @@
-//! The open project, its per-session undo history, and what changed since the canvas last looked.
+//! A canvas being worked on, its per-session undo history, and what changed since the canvas last
+//! looked.
 //!
 //! Every change goes through here. Painting is a *stroke*: cells set one at a time, recorded with
 //! their old values, and pushed as one undo step when the stroke ends. Anything else — the
@@ -9,11 +10,10 @@
 //! Undo lives only as long as the session; nothing of it is written to the file.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use pixelle_core::layer::LayerKind;
-use pixelle_core::{Grid, IRect, IVec2, LayerId, Project, format};
+use pixelle_core::{Grid, IRect, IVec2, LayerId, Project};
 
 /// How long a run of the same keyed edit keeps folding into one undo step.
 const COALESCE: Duration = Duration::from_millis(1500);
@@ -85,12 +85,12 @@ struct Stroke {
 
 pub struct Document {
     pub project: Project,
-    pub path: Option<PathBuf>,
+    /// Changed since it was last read back into its file.
     pub dirty: bool,
     /// Bumped on every change; caches key on it.
     pub revision: u64,
-    /// The file's modification time when last read or written, to notice outside changes.
-    pub disk_mtime: Option<SystemTime>,
+    /// Paint only inside sprite frames and tiles: what is outside them belongs to no file.
+    pub clip: bool,
     undo: Vec<Change>,
     redo: Vec<Change>,
     stroke: Option<Stroke>,
@@ -98,28 +98,15 @@ pub struct Document {
     coalesce: Option<(String, Instant)>,
 }
 
-fn mtime(path: &Path) -> Option<SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
-}
-
-/// Where an unsaved copy of `path` is kept.
-pub fn autosave_path(path: &Path) -> PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(".autosave");
-    path.with_file_name(name)
-}
-
 impl Document {
-    pub fn new(project: Project, path: Option<PathBuf>) -> Self {
-        let disk_mtime = path.as_deref().and_then(mtime);
+    pub fn new(project: Project) -> Self {
         let mut changes = Changes::default();
         changes.everything();
         Self {
             project,
-            path,
             dirty: false,
             revision: 0,
-            disk_mtime,
+            clip: false,
             undo: Vec::new(),
             redo: Vec::new(),
             stroke: None,
@@ -128,45 +115,22 @@ impl Document {
         }
     }
 
-    pub fn open(path: &Path) -> anyhow::Result<Self> {
-        let project = format::load_file(path)?;
-        Ok(Self::new(project, Some(path.to_path_buf())))
+    /// Whether a pixel of a pixel layer belongs to a frame or a tile, when painting is clipped.
+    pub fn paintable(&self, p: IVec2) -> bool {
+        !self.clip
+            || self.project.sprites.iter().any(|s| s.frames.iter().any(|f| f.rect.contains(p)))
+            || self.project.tilesets.iter().any(|ts| (0..ts.count).any(|i| ts.tile_rect(i).contains(p)))
     }
 
-    pub fn save(&mut self) -> anyhow::Result<()> {
-        self.end();
-        let path = self.path.clone().ok_or_else(|| anyhow::anyhow!("no file to save to"))?;
-        format::save_file(&self.project, &path)?;
-        self.dirty = false;
-        self.disk_mtime = mtime(&path);
-        let _ = std::fs::remove_file(autosave_path(&path));
-        Ok(())
+    /// Everything must be redrawn: after the canvas was swapped or changed underneath.
+    pub fn touch_all(&mut self) {
+        self.changes.everything();
+        self.revision += 1;
     }
 
-    /// Write the unsaved state beside the file, for crash recovery.
-    pub fn autosave(&self) -> anyhow::Result<()> {
-        if let Some(path) = &self.path {
-            std::fs::write(autosave_path(path), format::save(&self.project)?)?;
-        }
-        Ok(())
-    }
-
-    /// Whether the file on disk changed since we last read or wrote it.
-    pub fn changed_on_disk(&self) -> bool {
-        match (&self.path, self.disk_mtime) {
-            (Some(p), Some(t)) => mtime(p).is_some_and(|now| now != t),
-            _ => false,
-        }
-    }
-
-    /// Replace the project with the file on disk. Undo history survives as snapshots can.
-    pub fn reload(&mut self) -> anyhow::Result<()> {
-        let path = self.path.clone().ok_or_else(|| anyhow::anyhow!("no file"))?;
-        let project = format::load_file(&path)?;
-        self.edit("Reload from disk", None, |p| *p = project);
-        self.dirty = false;
-        self.disk_mtime = mtime(&path);
-        Ok(())
+    /// Whether there is anything to undo.
+    pub fn has_history(&self) -> bool {
+        !self.undo.is_empty() || self.stroke.is_some()
     }
 
     pub fn take_changes(&mut self) -> Changes {
@@ -219,8 +183,13 @@ impl Document {
 
     /// Set a cell in the stroke in progress. Does nothing outside a stroke.
     pub fn set(&mut self, p: IVec2, v: u8) {
-        let Some(stroke) = &mut self.stroke else { return };
+        let Some(stroke) = &self.stroke else { return };
         let layer = stroke.layer;
+        let is_pixels = self.project.layer(layer).is_some_and(|l| l.pixels().is_some());
+        if is_pixels && !self.paintable(p) {
+            return;
+        }
+        let Some(stroke) = &mut self.stroke else { return };
         let Some(grid) = Self::grid_mut(&mut self.project, layer) else { return };
         let old = grid.get(p);
         if old == v {
@@ -397,7 +366,7 @@ mod tests {
         p.palette.begin_section("S");
         p.palette.push("a", [1, 1, 1, 255]).unwrap();
         let l = p.add_layer("art", LayerKind::Pixels(Grid::new()));
-        (Document::new(p, None), l)
+        (Document::new(p), l)
     }
 
     #[test]

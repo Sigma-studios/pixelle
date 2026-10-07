@@ -151,27 +151,3 @@ pub const HOLE_ALPHA: f32 = 0.3;
 
 /// `level.rs:597`: behind a player-made level in the picker.
 pub const CUSTOM_LEVEL: [f32; 3] = [0.600, 0.604, 0.612];
-
-/// Bevy's sprite tint: both colours to linear light, multiplied, and back to sRGB.
-pub fn tint(texel: [u8; 4], by: [f32; 3]) -> [u8; 4] {
-    let lin = |v: f32| {
-        if v <= 0.04045 {
-            v / 12.92
-        } else {
-            ((v + 0.055) / 1.055).powf(2.4)
-        }
-    };
-    let srgb = |v: f32| {
-        if v <= 0.0031308 {
-            v * 12.92
-        } else {
-            1.055 * v.powf(1.0 / 2.4) - 0.055
-        }
-    };
-    let mut out = texel;
-    for c in 0..3 {
-        let v = srgb(lin(texel[c] as f32 / 255.0) * lin(by[c]));
-        out[c] = (v * 255.0).round() as u8;
-    }
-    out
-}
