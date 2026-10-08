@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use pixelle_core::folder::{self, ProjectDir, SpriteFile, SpriteFrame, SpriteLayer, TerrainFile};
+use pixelle_core::folder::{self, ProjectDir, SpriteFile, SpriteFrame, SpriteLayer, Step, TerrainFile};
 use pixelle_core::layer::{LayerKind, TerrainLayer};
 use pixelle_core::render::Indexed;
 use pixelle_core::tiles::Tileset;
@@ -120,8 +120,15 @@ pub fn sprite_canvas(project: &ProjectDir, name: &str, s: &SpriteFile) -> Projec
         let names: Vec<String> = s.frames.iter().map(|f| f.name.clone().unwrap_or_default()).collect();
         sprite.tags.insert(FRAME_NAMES.into(), names.join(", "));
     }
+    let anims = folder::anim_sprites(name, s, &sprite.frames, &sprite.layers);
     p.sprites.push(sprite);
+    p.sprites.extend(anims);
     p
+}
+
+/// Whether a sprite of a canvas is one of the sheet's animations rather than the sheet.
+pub fn is_anim(s: &Sprite) -> bool {
+    s.tags.contains_key(folder::ANIM_OF)
 }
 
 /// A sprite canvas read back into its file.
@@ -130,7 +137,7 @@ pub fn canvas_sprite(p: &Project) -> SpriteFile {
     s.frames.clear();
     let pixel_layers: Vec<_> = p.layers.iter().filter(|l| l.pixels().is_some()).collect();
     s.layers = pixel_layers.iter().map(|l| SpriteLayer { name: l.name.clone(), export: !l.reference, visible: l.visible }).collect();
-    let Some(sprite) = p.sprites.first() else { return s };
+    let Some(sprite) = p.sprites.iter().find(|s| !is_anim(s)) else { return s };
     let mut tags = sprite.tags.clone();
     let names: Vec<Option<String>> = tags
         .remove(FRAME_NAMES)
@@ -150,6 +157,16 @@ pub fn canvas_sprite(p: &Project) -> SpriteFile {
         }
         s.frames.push(frame);
     }
+    // Each animation's steps are frames of the sheet: found again by where they are.
+    for a in p.sprites.iter().filter(|s| is_anim(s)) {
+        let Some((_, anim)) = a.name.rsplit_once(folder::ANIM_SEPARATOR) else { continue };
+        let steps = a
+            .frames
+            .iter()
+            .filter_map(|f| sprite.frames.iter().position(|sf| sf.rect == f.rect).map(|frame| Step { frame, duration: f.duration }))
+            .collect();
+        s.anims.insert(anim.to_string(), steps);
+    }
     s
 }
 
@@ -158,7 +175,7 @@ pub fn canvas_sprite(p: &Project) -> SpriteFile {
 pub fn reshape_sprite(p: &Project, f: impl FnOnce(&mut SpriteFile)) -> Project {
     let mut s = canvas_sprite(p);
     f(&mut s);
-    let name = p.sprites.first().map_or(String::new(), |s| s.name.clone());
+    let name = p.sprites.iter().find(|s| !is_anim(s)).map_or(String::new(), |s| s.name.clone());
     let mut dir = ProjectDir::new(p.name.clone());
     dir.grid = p.grid;
     dir.palette = p.palette.clone();
@@ -495,6 +512,7 @@ mod tests {
         b.set(5, 1, 9);
         f.set_layer("sketch", b);
         s.frames.push(f);
+        s.anims.insert("wave".into(), vec![Step { frame: 1, duration: 0.2 }, Step { frame: 0, duration: 0.1 }]);
         p.sprites.insert("hero".into(), s);
         let mut t = TerrainFile::new(Preset::TwoSurface { mirror: false }, 8);
         for (i, pic) in t.tiles.iter_mut().enumerate() {

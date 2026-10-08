@@ -11,6 +11,8 @@
 //!   unexported `walls2.aseprite` as work in progress;
 //! - the walls as a terrain, "2D grid, two surfaces" with the mirror off: every way a tile faces is
 //!   drawn out, starting from the seven frames `cladding.rs` turns to fit;
+//! - the cycles the game plays out of its sheets in code — running, crouch-walking, a shell, a
+//!   rocket — as animations of those sheets, with the game's timings;
 //! - every colour the game's code names, as labelled palette sections.
 //!
 //! With `--showcase`, also what the showcase demonstrates and run-2d does not read from art yet:
@@ -27,7 +29,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, ensure};
 use pixelle_core::aseprite;
 use pixelle_core::bake;
-use pixelle_core::folder::{Preset, ProjectDir, SpriteFile, SpriteFrame, SpriteLayer, TerrainFile};
+use pixelle_core::folder::{Preset, ProjectDir, SpriteFile, SpriteFrame, SpriteLayer, Step, TerrainFile};
 use pixelle_core::render::{Indexed, RgbaImage};
 use pixelle_core::tiles::presets;
 use pixelle_core::{IRect, IVec2, SwapSlot, png_io};
@@ -106,6 +108,12 @@ const RAGDOLL_CUTS: [(&str, [i32; 4]); 6] = [
 /// `weapon.rs:507-509`.
 const TRIGGER: IVec2 = IVec2::new(4, 4);
 const MUZZLE: IVec2 = IVec2::new(6, 3);
+/// `player.rs`: seconds between the frames of the run and crouch-walk cycles.
+const RUN_FRAME_TIME: f32 = 0.11;
+/// `weapon.rs`: a shell (and a rocket) shows its first frame this many ticks, then its second
+/// for the other.
+const SHELL_RING_TICKS: f32 = 8.0;
+const SHELL_CORE_TICKS: f32 = 4.0;
 /// `weapon.rs:457-458`.
 const EXPLOSION_TICKS: u32 = 8;
 const EXPLOSION_RADIUS: f32 = 18.0;
@@ -314,6 +322,7 @@ impl Import {
         self.sheet("emotes", &[], &[])?;
         self.sheet("platforms", &[], &PLATFORMS)?;
         self.walls()?;
+        self.animations();
 
         // Drawn, never exported: kept where it can be finished.
         let path = self.root.join("assets/images/walls2.aseprite");
@@ -331,6 +340,28 @@ impl Import {
             self.notes.push(format!("walls2.aseprite has no PNG and nothing uses it; its {} frames are wip/walls2", ase.frames.len()));
         }
         Ok(())
+    }
+
+    /// The cycles the game plays out of its sheets in code, as animations of them, so they can be
+    /// watched in the editor: `player.rs` `animate` and `weapon.rs` `two_frame`.
+    fn animations(&mut self) {
+        let step = |frame: usize, duration: f32| Step { frame, duration };
+        let named = |s: &SpriteFile, name: &str| s.frames.iter().position(|f| f.name.as_deref() == Some(name));
+        if let Some(player) = self.p.sprites.get_mut("player") {
+            for (anim, [a, b]) in [("run", ["run_1", "run_2"]), ("crouch_walk", ["crouch", "crouch_walk"])] {
+                if let (Some(a), Some(b)) = (named(player, a), named(player, b)) {
+                    player.anims.insert(anim.into(), vec![step(a, RUN_FRAME_TIME), step(b, RUN_FRAME_TIME)]);
+                }
+            }
+        }
+        if let Some(weapons) = self.p.sprites.get_mut("weapons") {
+            let (ring, core) = (SHELL_RING_TICKS * TICK, SHELL_CORE_TICKS * TICK);
+            for (anim, [a, b]) in [("shell", ["shell_1", "shell_2"]), ("rocket", ["rocket_1", "rocket_2"])] {
+                if let (Some(a), Some(b)) = (named(weapons, a), named(weapons, b)) {
+                    weapons.anims.insert(anim.into(), vec![step(a, ring), step(b, core)]);
+                }
+            }
+        }
     }
 
     /// A sheet's PNG, as the game sees it.

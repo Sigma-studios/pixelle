@@ -107,10 +107,21 @@ pub fn codegen(baked: &Baked, module: &str, crate_path: &str, source: &str) -> S
     let mut points = BTreeSet::new();
     let mut rects = BTreeSet::new();
     for s in &baked.sprites {
-        let parts: Vec<&str> = s.name.split('/').collect();
-        let (leaf, dirs) = parts.split_last().expect("names are not empty");
+        // An animation of a sheet goes beside its frame names: `art::player::anims::RUN`.
+        let anim = s.tags.get(pixelle_core::folder::ANIM_OF).and_then(|sheet| {
+            let leaf = s.name.rsplit_once(pixelle_core::folder::ANIM_SEPARATOR)?.1;
+            Some((sheet.clone(), leaf.to_string()))
+        });
+        let (dirs, leaf): (Vec<String>, String) = match &anim {
+            Some((sheet, leaf)) => (sheet.split('/').map(str::to_string).chain(["anims".to_string()]).collect(), leaf.clone()),
+            None => {
+                let mut parts: Vec<String> = s.name.split('/').map(str::to_string).collect();
+                let leaf = parts.pop().expect("names are not empty");
+                (parts, leaf)
+            }
+        };
         let mut node = &mut root;
-        for d in dirs {
+        for d in &dirs {
             node = node.children.entry(module_ident(d)).or_default();
         }
         let kind = if s.is_animation() {
@@ -125,18 +136,15 @@ pub fn codegen(baked: &Baked, module: &str, crate_path: &str, source: &str) -> S
         node.consts.push(format!(
             "/// `{}`: {kind}.\npub const {}: {crate_path}::SpriteId = {crate_path}::SpriteId({:?});",
             s.name,
-            const_ident(leaf),
+            const_ident(&leaf),
             s.name
         ));
-        // A `frames` tag names the frames: a module of their indices.
+        // A `frames` tag names the frames: their indices, in a module of the sprite's name.
         if let Some(names) = s.tags.get("frames") {
-            let mut m = String::new();
-            let _ = writeln!(m, "/// Frame indices of `{}`.\npub mod {} {{", s.name, module_ident(leaf));
-            for (i, n) in names.split(',').map(str::trim).enumerate() {
-                let _ = writeln!(m, "    pub const {}: usize = {i};", const_ident(n));
+            let m = node.children.entry(module_ident(&leaf)).or_default();
+            for (i, n) in names.split(',').map(str::trim).enumerate().filter(|(_, n)| !n.is_empty()) {
+                m.consts.push(format!("/// Frame {i} of `{}`.\npub const {}: usize = {i};", s.name, const_ident(n)));
             }
-            m.push('}');
-            node.consts.push(m);
         }
         for f in &s.frames {
             points.extend(f.points.keys().cloned());

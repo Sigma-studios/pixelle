@@ -354,7 +354,7 @@ impl Editor {
 
     /// The topmost sprite frame under a pixel.
     pub fn frame_at(&self, px: IVec2) -> Option<(String, usize, IRect)> {
-        self.doc.project.sprites.iter().rev().find_map(|s| {
+        self.doc.project.sprites.iter().rev().filter(|s| !workspace::is_anim(s)).find_map(|s| {
             s.frames.iter().enumerate().find(|(_, f)| f.rect.contains(px)).map(|(i, f)| (s.name.clone(), i, f.rect))
         })
     }
@@ -541,11 +541,12 @@ impl Editor {
         let mut animating = false;
         let sprites = self.doc.project.sprites.clone();
         for s in &sprites {
+            let anim = workspace::is_anim(s);
             let is_sel = selected.as_ref().is_some_and(|(n, _)| *n == s.name);
             let is_hover = hovered.as_deref() == Some(s.name.as_str());
             let visible = s.frames.iter().any(|f| !f.rect.intersect(&vis).is_empty());
 
-            if self.opts.sprite_boxes && visible {
+            if self.opts.sprite_boxes && visible && !anim {
                 for (i, f) in s.frames.iter().enumerate() {
                     let r = self.view.rect_to_screen(screen, f.rect);
                     let (w, c) = if is_sel {
@@ -571,7 +572,7 @@ impl Editor {
             }
 
             // Anchors of the selected sprite.
-            if is_sel {
+            if is_sel && !anim {
                 for f in &s.frames {
                     for (name, p) in &f.points {
                         let c = self.view.to_screen(screen, pos2(f.rect.x as f32 + p.x as f32 + 0.5, f.rect.y as f32 + p.y as f32 + 0.5));
@@ -612,6 +613,9 @@ impl Editor {
                     painter.image(tex, r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
                 }
                 painter.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::from_rgb(120, 200, 255)), StrokeKind::Outside);
+                if let Some((_, name)) = s.name.rsplit_once(pixelle_core::folder::ANIM_SEPARATOR) {
+                    painter.text(r.left_top() - vec2(0.0, 2.0), Align2::LEFT_BOTTOM, name, label_font.clone(), Color32::from_rgb(120, 200, 255));
+                }
                 animating = true;
             }
         }
@@ -631,7 +635,22 @@ impl Editor {
         let mut renderer = Renderer::new(p);
         let mut taken: Vec<IRect> = p.sprites.iter().flat_map(|s| s.frames.iter().map(|f| f.rect)).collect();
         let mut out = HashMap::new();
-        for s in p.sprites.iter().filter(|s| s.is_animation()) {
+        // A sheet's animations play in a column to its left, one under the other.
+        let mut column: HashMap<String, i32> = HashMap::new();
+        for s in p.sprites.iter().filter(|s| workspace::is_anim(s) && s.is_animation()) {
+            let sheet = s.tags.get(pixelle_core::folder::ANIM_OF).and_then(|n| p.sprite(n));
+            let Some(sheet) = sheet else { continue };
+            let left = sheet.frames.iter().map(|f| f.rect.x).min().unwrap_or(0);
+            let w = s.frames.iter().map(|f| f.size().0).max().unwrap_or(1);
+            let h = s.frames.iter().map(|f| f.size().1).max().unwrap_or(1);
+            let gap = (w.min(h) as i32 / 2).max(4);
+            let y = column.entry(sheet.name.clone()).or_insert(sheet.frames[0].rect.y);
+            let r = IRect::new(left - 2 * gap - w as i32, *y, w, h);
+            *y += h as i32 + 2 * gap;
+            taken.push(r);
+            out.insert(s.name.clone(), r);
+        }
+        for s in p.sprites.iter().filter(|s| s.is_animation() && !workspace::is_anim(s)) {
             let f0 = &s.frames[0];
             let (w, h) = f0.size();
             let gap = (w.min(h) as i32 / 4).max(2);

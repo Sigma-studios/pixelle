@@ -108,6 +108,13 @@ pub struct FrameRef<'a> {
 }
 
 impl PixelleArt {
+    /// Art made from baked data without the asset server, e.g. in a test that builds a world by
+    /// hand. A game loads its art with `AssetServer::load` instead.
+    pub fn from_baked(baked: Baked, images: &mut Assets<Image>, layouts: &mut Assets<TextureAtlasLayout>) -> Self {
+        let (image, layout, by_name) = parts(&baked);
+        PixelleArt { atlas: images.add(image), layout: layouts.add(layout), baked, by_name }
+    }
+
     pub fn sprite(&self, name: impl AsRef<str>) -> Option<SpriteRef<'_>> {
         let &(i, first) = self.by_name.get(name.as_ref())?;
         Some(SpriteRef { sprite: &self.baked.sprites[i], first })
@@ -273,6 +280,23 @@ impl TerrainRef<'_> {
     }
 }
 
+/// The atlas image, its layout, and where each sprite's frames start in it.
+fn parts(baked: &Baked) -> (Image, TextureAtlasLayout, HashMap<String, (usize, usize)>) {
+    let image = atlas_image(baked, baked.atlas_rgba());
+    let mut layout = TextureAtlasLayout::new_empty(UVec2::new(baked.atlas_width, baked.atlas_height));
+    let mut by_name = HashMap::new();
+    for (i, s) in baked.sprites.iter().enumerate() {
+        let mut first = None;
+        for f in &s.frames {
+            let r = f.rect;
+            let at = layout.add_texture(URect::new(r.x as u32, r.y as u32, r.x as u32 + r.w, r.y as u32 + r.h));
+            first.get_or_insert(at);
+        }
+        by_name.insert(s.name.clone(), (i, first.unwrap_or(0)));
+    }
+    (image, layout, by_name)
+}
+
 fn atlas_image(baked: &Baked, rgba: Vec<u8>) -> Image {
     let mut image = Image::new(
         Extent3d { width: baked.atlas_width, height: baked.atlas_height, depth_or_array_layers: 1 },
@@ -354,18 +378,7 @@ impl AssetLoader for PixelleLoader {
                 ctx.add_labeled_asset(sheet_label(&s.name), image);
             }
         }
-        let image = atlas_image(&baked, baked.atlas_rgba());
-        let mut layout = TextureAtlasLayout::new_empty(UVec2::new(baked.atlas_width, baked.atlas_height));
-        let mut by_name = HashMap::new();
-        for (i, s) in baked.sprites.iter().enumerate() {
-            let mut first = None;
-            for f in &s.frames {
-                let r = f.rect;
-                let at = layout.add_texture(URect::new(r.x as u32, r.y as u32, r.x as u32 + r.w, r.y as u32 + r.h));
-                first.get_or_insert(at);
-            }
-            by_name.insert(s.name.clone(), (i, first.unwrap_or(0)));
-        }
+        let (image, layout, by_name) = parts(&baked);
         Ok(PixelleArt {
             atlas: ctx.add_labeled_asset("atlas", image),
             layout: ctx.add_labeled_asset("layout", layout),

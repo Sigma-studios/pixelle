@@ -140,7 +140,36 @@ pub struct SpriteFile {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tags: BTreeMap<String, String>,
     pub frames: Vec<SpriteFrame>,
+    /// Animations made of the frames, by name: `"run"` is frames 1 and 2 for 0.11 s each. The game
+    /// plays one as a sprite of its own, `player#run`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub anims: BTreeMap<String, Vec<Step>>,
 }
+
+/// One step of an animation: a frame of its sprite, shown for a while. Written `(frame, seconds)`.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(from = "(usize, f32)", into = "(usize, f32)")]
+pub struct Step {
+    /// Which frame, by index.
+    pub frame: usize,
+    /// Seconds.
+    pub duration: f32,
+}
+
+impl From<(usize, f32)> for Step {
+    fn from((frame, duration): (usize, f32)) -> Self {
+        Step { frame, duration }
+    }
+}
+
+impl From<Step> for (usize, f32) {
+    fn from(s: Step) -> Self {
+        (s.frame, s.duration)
+    }
+}
+
+/// What separates a sprite's name from one of its animations': `player#run`.
+pub const ANIM_SEPARATOR: char = '#';
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SpriteLayer {
@@ -225,6 +254,43 @@ impl SpriteFile {
             pivot: None,
             tags: BTreeMap::new(),
             frames: vec![SpriteFrame::new(w, h)],
+            anims: BTreeMap::new(),
+        }
+    }
+
+    /// Put a frame at `at`, keeping every animation on the frames it showed.
+    pub fn insert_frame(&mut self, at: usize, frame: SpriteFrame) {
+        self.frames.insert(at, frame);
+        for step in self.anims.values_mut().flatten() {
+            if step.frame >= at {
+                step.frame += 1;
+            }
+        }
+    }
+
+    /// Take out the frame at `at`. Steps that showed it go, and the rest keep their frames.
+    pub fn remove_frame(&mut self, at: usize) -> SpriteFrame {
+        let f = self.frames.remove(at);
+        for steps in self.anims.values_mut() {
+            steps.retain(|s| s.frame != at);
+            for step in steps {
+                if step.frame > at {
+                    step.frame -= 1;
+                }
+            }
+        }
+        f
+    }
+
+    /// Swap two frames, and the steps that show them.
+    pub fn swap_frames(&mut self, a: usize, b: usize) {
+        self.frames.swap(a, b);
+        for step in self.anims.values_mut().flatten() {
+            if step.frame == a {
+                step.frame = b;
+            } else if step.frame == b {
+                step.frame = a;
+            }
         }
     }
 
@@ -786,6 +852,21 @@ impl ProjectDir {
                 }
             }
         }
+        for (name, s) in &self.sprites {
+            for (anim, steps) in &s.anims {
+                if anim.is_empty() || anim.contains([ANIM_SEPARATOR, '/', ',']) {
+                    out.push(format!("{name}: an animation cannot be called {anim:?}"));
+                }
+                if steps.is_empty() {
+                    out.push(format!("{name}: animation {anim:?} has no steps"));
+                }
+                for step in steps {
+                    if step.frame >= s.frames.len() {
+                        out.push(format!("{name}: animation {anim:?} shows frame {}, of {}", step.frame, s.frames.len()));
+                    }
+                }
+            }
+        }
         for (name, t) in &self.terrains {
             if t.cell == 0 || t.cell % 2 != 0 {
                 out.push(format!("{name}: cells of {} pixels cannot be split in quarters", t.cell));
@@ -852,7 +933,12 @@ impl ProjectDir {
                     s.frames.iter().enumerate().map(|(i, f)| f.name.clone().unwrap_or_else(|| format!("frame_{i}"))).collect();
                 sprite.tags.insert("frames".into(), names.join(", "));
             }
+            let sheet_frames = sprite.frames.clone();
+            let exported = sprite.layers.clone();
             p.sprites.push(sprite);
+            for anim in anim_sprites(name, s, &sheet_frames, &exported) {
+                p.sprites.push(anim);
+            }
             y += tall + GAP;
         }
         for (name, t) in &self.terrains {
@@ -876,6 +962,27 @@ impl ProjectDir {
         p
     }
 }
+
+/// A sprite's animations as sprites of their own on its canvas: each step the rectangle of the
+/// frame it shows, with the step's duration. Named `sprite#anim`, and tagged with the sprite.
+pub fn anim_sprites(name: &str, s: &SpriteFile, sheet_frames: &[Frame], layers: &[crate::layer::LayerId]) -> Vec<Sprite> {
+    s.anims
+        .iter()
+        .map(|(anim, steps)| {
+            let frames = steps
+                .iter()
+                .filter_map(|step| sheet_frames.get(step.frame).map(|f| Frame { duration: step.duration, ..f.clone() }))
+                .collect();
+            let mut sprite = Sprite::new(format!("{name}{ANIM_SEPARATOR}{anim}"), layers.to_vec(), frames);
+            sprite.pivot = s.pivot;
+            sprite.tags.insert(ANIM_OF.into(), name.into());
+            sprite
+        })
+        .collect()
+}
+
+/// The tag an animation's sprite carries: which sprite it is an animation of.
+pub const ANIM_OF: &str = "anim_of";
 
 fn paint(grid: &mut Grid, pic: &Indexed, at: IVec2) {
     for yy in 0..pic.h {
@@ -919,6 +1026,7 @@ mod tests {
         f.duration = 0.11;
         f.name = Some("run".into());
         s.frames.push(f);
+        s.anims.insert("blink".into(), vec![Step { frame: 0, duration: 0.5 }, Step { frame: 1, duration: 0.1 }]);
         p.sprites.insert("player/idle".into(), s);
         let mut t = TerrainFile::new(Preset::TwoSurface { mirror: false }, 8);
         t.tiles[0].set(0, 0, 5);
@@ -994,5 +1102,28 @@ mod tests {
         assert_eq!(r.frame("player/idle", 0).unwrap(), p.sprites["player/idle"].composite(0));
         assert_eq!(canvas.sprite("player/idle").unwrap().tags["frames"], "frame_0, run");
         assert!(canvas.validate().is_empty(), "{:?}", canvas.validate());
+    }
+
+    #[test]
+    fn animations_bake_as_sprites_of_their_own() {
+        let p = sample();
+        let baked = crate::bake::bake_folder(&p);
+        let sheet = baked.sprite("player/idle").unwrap();
+        let blink = baked.sprite("player/idle#blink").unwrap();
+        assert!(blink.is_animation());
+        assert_eq!(blink.frames[0].rect, sheet.frames[0].rect, "a step shares its frame's place in the atlas");
+        assert_eq!(blink.frames[1].duration, 0.1);
+        assert_eq!(blink.tags[ANIM_OF], "player/idle");
+    }
+
+    #[test]
+    fn frame_edits_keep_animations_on_their_frames() {
+        let mut s = sample().sprites["player/idle"].clone();
+        s.insert_frame(0, SpriteFrame::new(4, 3));
+        assert_eq!(s.anims["blink"].iter().map(|x| x.frame).collect::<Vec<_>>(), [1, 2]);
+        s.swap_frames(1, 2);
+        assert_eq!(s.anims["blink"].iter().map(|x| x.frame).collect::<Vec<_>>(), [2, 1]);
+        s.remove_frame(1);
+        assert_eq!(s.anims["blink"].iter().map(|x| x.frame).collect::<Vec<_>>(), [1]);
     }
 }

@@ -860,7 +860,7 @@ impl Editor {
             Selected::Sprite { name, frame } => p.sprite(name).is_some_and(|s| *frame < s.frames.len()),
         };
         if !ok {
-            self.selected = match p.sprites.first() {
+            self.selected = match p.sprites.iter().find(|s| !workspace::is_anim(s)) {
                 Some(s) => Selected::Sprite { name: s.name.clone(), frame: 0 },
                 None => Selected::None,
             };
@@ -955,7 +955,13 @@ impl Editor {
                 self.tabs[i].kind = k;
                 let d = self.tab_doc_mut(i);
                 for s in &mut d.project.sprites {
-                    s.name = to.to_string();
+                    s.name = match s.name.rsplit_once(folder::ANIM_SEPARATOR) {
+                        Some((_, anim)) => format!("{to}{}{anim}", folder::ANIM_SEPARATOR),
+                        None => to.to_string(),
+                    };
+                    if s.tags.contains_key(folder::ANIM_OF) {
+                        s.tags.insert(folder::ANIM_OF.into(), to.to_string());
+                    }
                 }
                 for t in &mut d.project.tilesets {
                     t.name = to.to_string();

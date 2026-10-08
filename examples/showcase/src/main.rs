@@ -1,7 +1,7 @@
 //! run-2d's art, straight from the project folder `assets/run2d`.
 //!
-//! Everything here is looked up by name through the generated `art` module — sprites, and the
-//! frames of a sheet by their names, no pixel constants. Weapons sit in hands by the project's own
+//! Everything here is looked up by name through the generated `art` module — sprites, a sheet's
+//! frames and its animations by their names, no pixel constants. Weapons sit in hands by the project's own
 //! `hand` and `trigger` points; players are recoloured through its recolour slots; a grid map is
 //! autotiled by its walls terrain.
 //!
@@ -36,7 +36,7 @@ fn main() {
         )
         .add_plugins(PixellePlugin)
         .add_systems(Startup, setup)
-        .add_systems(Update, (populate, cycle.before(PixelleSystems), seat_held.after(PixelleSystems), screenshot))
+        .add_systems(Update, (populate, seat_held.after(PixelleSystems), screenshot))
         .run();
 }
 
@@ -90,34 +90,39 @@ fn populate(mut commands: Commands, art: Res<Art>, arts: Res<Assets<PixelleArt>>
         ));
     }
 
-    // Runners and posers, each holding something by the project's anchors. The two-frame cycles
-    // flip between their frames of the sheet, as run-2d does.
+    // Runners and posers, each holding something by the project's anchors. The cycles are
+    // animations of the sheet, played by name; the poses are frames of it.
     use art::{player as pose, weapons as weapon};
+    enum Body {
+        Plays(bevy_pixelle::SpriteId),
+        Pose(usize),
+    }
     let armed = [
-        ([pose::RUN_1, pose::RUN_2], weapon::SHOTGUN, false, palette::clothing::RUST),
-        ([pose::JUMP_ARMED; 2], weapon::ROCKET_LAUNCHER, false, palette::clothing::GREEN),
-        ([pose::CROUCH, pose::CROUCH_WALK], weapon::GRENADE_LAUNCHER, true, palette::clothing::PURPLE),
-        ([pose::WALL_SLIDE_ARMED; 2], weapon::NET_GUN, true, palette::clothing::YELLOW),
-        ([pose::IDLE; 2], weapon::SWORD, false, palette::clothing::CYAN),
-        ([pose::IDLE; 2], weapon::FLAG_RED, false, palette::clothing::FLAG_RED),
-        ([pose::SLIDE; 2], weapon::HANDGUN, false, palette::clothing::PINK),
-        ([pose::IDLE; 2], weapon::FLAG_BLUE, true, palette::clothing::NAVY),
+        (Body::Plays(pose::anims::RUN), weapon::SHOTGUN, false, palette::clothing::RUST),
+        (Body::Pose(pose::JUMP_ARMED), weapon::ROCKET_LAUNCHER, false, palette::clothing::GREEN),
+        (Body::Plays(pose::anims::CROUCH_WALK), weapon::GRENADE_LAUNCHER, true, palette::clothing::PURPLE),
+        (Body::Pose(pose::WALL_SLIDE_ARMED), weapon::NET_GUN, true, palette::clothing::YELLOW),
+        (Body::Pose(pose::IDLE), weapon::SWORD, false, palette::clothing::CYAN),
+        (Body::Pose(pose::IDLE), weapon::FLAG_RED, false, palette::clothing::FLAG_RED),
+        (Body::Pose(pose::SLIDE), weapon::HANDGUN, false, palette::clothing::PINK),
+        (Body::Pose(pose::IDLE), weapon::FLAG_BLUE, true, palette::clothing::NAVY),
     ];
-    for (i, (frames, held, left, shirt)) in armed.into_iter().enumerate() {
-        let by = commands
-            .spawn((
-                sprite(art::PLAYER).frame(frames[0]).swap(art::swaps::SHIRT, shirt).flipped_x(left),
-                Cycle(frames),
-                at(-84.0 + i as f32 * 24.0, 14.0, 0.0),
-            ))
-            .id();
+    for (i, (body, held, left, shirt)) in armed.into_iter().enumerate() {
+        let (look, plays) = match body {
+            Body::Plays(anim) => (sprite(anim), true),
+            Body::Pose(frame) => (sprite(art::PLAYER).frame(frame), false),
+        };
+        let mut e = commands.spawn((look.swap(art::swaps::SHIRT, shirt).flipped_x(left), at(-84.0 + i as f32 * 24.0, 14.0, 0.0)));
+        if plays {
+            e.insert(PixelleAnimation::looping());
+        }
+        let by = e.id();
         commands.spawn((sprite(art::WEAPONS).frame(held).flipped_x(left), Held { by }, at(0.0, 0.0, 0.5)));
     }
 
-    // Things that play: a sprite that is an animation, and two-frame cycles of a sheet.
-    commands.spawn((sprite(art::fx::EXPLOSION), PixelleAnimation::looping(), at(104.0, -22.0, 1.0)));
-    for (frames, x) in [([weapon::ROCKET_1, weapon::ROCKET_2], -30.0), ([weapon::SHELL_1, weapon::SHELL_2], -10.0)] {
-        commands.spawn((sprite(art::WEAPONS).frame(frames[0]), Cycle(frames), at(x, -18.0, 1.0)));
+    // Things that play: animations of their own, and animations of a sheet.
+    for (anim, x, y) in [(art::fx::EXPLOSION, 104.0, -22.0), (weapon::anims::ROCKET, -30.0, -18.0), (weapon::anims::SHELL, -10.0, -18.0)] {
+        commands.spawn((sprite(anim), PixelleAnimation::looping(), at(x, y, 1.0)));
     }
     for i in 0..a.sprite(art::EMOTES).map_or(0, |s| s.len()) {
         commands.spawn((sprite(art::EMOTES).frame(i), at(20.0 + i as f32 * 12.0, -18.0, 0.0)));
@@ -163,19 +168,6 @@ fn populate(mut commands: Commands, art: Res<Art>, arts: Res<Assets<PixelleArt>>
         commands.spawn((sprite(art::PROPS).frame(f), at(40.0 + i as f32 * 9.0, -58.0, -0.5)));
     }
     commands.spawn((sprite(art::fx::BULLET), at(80.0, 14.0, 0.5)));
-}
-
-/// Two frames of a sheet, swapped every 0.11 s: `player.rs` `RUN_FRAME_TIME`.
-#[derive(Component)]
-struct Cycle([usize; 2]);
-
-fn cycle(time: Res<Time>, mut q: Query<(&Cycle, &mut PixelleSprite)>) {
-    let phase = (time.elapsed_secs() / 0.11) as usize % 2;
-    for (c, mut ps) in &mut q {
-        if ps.frame != c.0[phase] {
-            ps.frame = c.0[phase];
-        }
-    }
 }
 
 /// Put each held thing in its holder's hand: the holder's `hand` point on the thing's `trigger`,

@@ -556,7 +556,7 @@ impl Editor {
                             fr.duration = 0.1;
                         }
                     }
-                    s.frames.insert(frame + 1, new);
+                    s.insert_frame(frame + 1, new);
                 });
                 self.selected = Selected::Sprite { name: name.into(), frame: frame + 1 };
             }
@@ -564,13 +564,13 @@ impl Editor {
                 self.edit_sprite("Duplicate frame", None, |s| {
                     let mut f = s.frames[frame].clone();
                     f.name = None;
-                    s.frames.insert(frame + 1, f);
+                    s.insert_frame(frame + 1, f);
                 });
                 self.selected = Selected::Sprite { name: name.into(), frame: frame + 1 };
             }
             if sprite.frames.len() > 1 && ui.button("Delete").clicked() {
                 self.edit_sprite("Delete frame", None, |s| {
-                    s.frames.remove(frame);
+                    s.remove_frame(frame);
                 });
                 self.selected = Selected::Sprite { name: name.into(), frame: frame.saturating_sub(1) };
             }
@@ -585,11 +585,11 @@ impl Editor {
         });
         ui.horizontal(|ui| {
             if ui.add_enabled(frame > 0, egui::Button::new("◀ Move")).clicked() {
-                self.edit_sprite("Move frame", None, |s| s.frames.swap(frame, frame - 1));
+                self.edit_sprite("Move frame", None, |s| s.swap_frames(frame, frame - 1));
                 self.selected = Selected::Sprite { name: name.into(), frame: frame - 1 };
             }
             if ui.add_enabled(frame + 1 < sprite.frames.len(), egui::Button::new("Move ▶")).clicked() {
-                self.edit_sprite("Move frame", None, |s| s.frames.swap(frame, frame + 1));
+                self.edit_sprite("Move frame", None, |s| s.swap_frames(frame, frame + 1));
                 self.selected = Selected::Sprite { name: name.into(), frame: frame + 1 };
             }
         });
@@ -684,6 +684,8 @@ impl Editor {
             }
         }
 
+        self.animations(ui, name, frame, sprite.frames.len(), &names);
+
         // Pivot and tags.
         ui.horizontal(|ui| {
             let mut has = sprite.pivot.is_some();
@@ -741,6 +743,121 @@ impl Editor {
             });
         }
         ui.label(RichText::new("A slot is a palette index the game may recolour from a section. Make one from a colour in the palette panel.").small().weak());
+    }
+}
+
+impl Editor {
+    /// The open sprite's animations: each a preview playing, and its steps.
+    fn animations(&mut self, ui: &mut egui::Ui, name: &str, frame: usize, frames: usize, names: &[String]) {
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Animations").strong());
+            if ui.button("+ New").on_hover_text(format!("An animation starting with frame {frame}")).clicked() {
+                let file = workspace::canvas_sprite(&self.doc.project);
+                let anim = (1..).map(|i| format!("anim_{i}")).find(|n| !file.anims.contains_key(n)).expect("unbounded");
+                self.edit_sprite("New animation", None, |s| {
+                    s.anims.insert(anim, vec![folder::Step { frame, duration: 0.1 }]);
+                });
+            }
+        });
+        let file = workspace::canvas_sprite(&self.doc.project);
+        if file.anims.is_empty() {
+            ui.label(RichText::new("Frames of this sprite played in an order, each for a while: the game plays one by name (art::…::anims::RUN). + New starts one from the frame selected.").small().weak());
+            return;
+        }
+        let frame_label = |i: usize| names.get(i).filter(|n| !n.is_empty()).map_or(format!("{i}"), |n| format!("{i} {n}"));
+        let t = self.time();
+        for (anim, steps) in &file.anims {
+            let sprite_name = format!("{name}{}{anim}", folder::ANIM_SEPARATOR);
+            ui.horizontal(|ui| {
+                // The preview, playing.
+                let total: f32 = steps.iter().map(|s| s.duration.max(0.001)).sum();
+                let mut clock = t % total.max(0.001);
+                let mut at = 0;
+                for (i, s) in steps.iter().enumerate() {
+                    if clock < s.duration.max(0.001) {
+                        at = i;
+                        break;
+                    }
+                    clock -= s.duration.max(0.001);
+                }
+                if let Some((tex, size)) = self.backend.frame(ui.ctx(), &self.doc.project, &sprite_name, at) {
+                    let k = (48.0 / size[0].max(size[1]) as f32).floor().max(1.0);
+                    let (r, _) = ui.allocate_exact_size(vec2(size[0] as f32 * k, size[1] as f32 * k), Sense::hover());
+                    ui.painter().rect_filled(r, 0.0, Color32::from_black_alpha(90));
+                    ui.painter().image(tex, r, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
+                }
+                ui.vertical(|ui| {
+                    let mut new = anim.clone();
+                    let r = ui.add(egui::TextEdit::singleline(&mut new).desired_width(120.0));
+                    if r.lost_focus() && new != *anim {
+                        let new = new.trim().replace([folder::ANIM_SEPARATOR, '/', ','], "_");
+                        if new.is_empty() || file.anims.contains_key(&new) {
+                            self.say("That name is taken or empty");
+                        } else {
+                            let old = anim.clone();
+                            self.edit_sprite("Rename animation", None, |s| {
+                                if let Some(steps) = s.anims.remove(&old) {
+                                    s.anims.insert(new, steps);
+                                }
+                            });
+                        }
+                    }
+                    ui.label(RichText::new(format!("{} steps · {:.0} ms", steps.len(), total * 1000.0)).small().weak());
+                });
+                if ui.small_button("Delete").clicked() {
+                    let old = anim.clone();
+                    self.edit_sprite("Delete animation", None, |s| {
+                        s.anims.remove(&old);
+                    });
+                }
+            });
+            for (si, step) in steps.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    let mut f = step.frame;
+                    egui::ComboBox::from_id_salt(("step", anim, si)).selected_text(frame_label(f)).width(120.0).show_ui(ui, |ui| {
+                        for i in 0..frames {
+                            ui.selectable_value(&mut f, i, frame_label(i));
+                        }
+                    });
+                    let mut ms = (step.duration * 1000.0).round() as u32;
+                    let changed_ms = ui.add(egui::DragValue::new(&mut ms).suffix(" ms").range(1..=10_000)).changed();
+                    let a = anim.clone();
+                    if f != step.frame || changed_ms {
+                        self.edit_sprite("Edit step", Some(&format!("step-{anim}-{si}")), |s| {
+                            if let Some(st) = s.anims.get_mut(&a).and_then(|v| v.get_mut(si)) {
+                                st.frame = f;
+                                st.duration = ms as f32 / 1000.0;
+                            }
+                        });
+                    }
+                    if ui.add_enabled(si > 0, egui::Button::new("Up").small()).clicked() {
+                        let a = anim.clone();
+                        self.edit_sprite("Move step", None, |s| s.anims.get_mut(&a).expect("the animation").swap(si, si - 1));
+                    }
+                    if ui.add_enabled(si + 1 < steps.len(), egui::Button::new("Down").small()).clicked() {
+                        let a = anim.clone();
+                        self.edit_sprite("Move step", None, |s| s.anims.get_mut(&a).expect("the animation").swap(si, si + 1));
+                    }
+                    if ui.add_enabled(steps.len() > 1, egui::Button::new("×").small()).clicked() {
+                        let a = anim.clone();
+                        self.edit_sprite("Remove step", None, |s| {
+                            s.anims.get_mut(&a).expect("the animation").remove(si);
+                        });
+                    }
+                });
+            }
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                if ui.small_button(format!("+ frame {frame}")).on_hover_text("Add the selected frame as the next step").clicked() {
+                    let a = anim.clone();
+                    let d = steps.last().map_or(0.1, |s| s.duration);
+                    self.edit_sprite("Add step", None, |s| s.anims.get_mut(&a).expect("the animation").push(folder::Step { frame, duration: d }));
+                }
+            });
+        }
     }
 }
 
