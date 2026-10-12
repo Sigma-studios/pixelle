@@ -902,7 +902,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pixelle-editor-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut ed = editor();
-        ed.open_project(&dir).unwrap();
+        ed.open_project(&dir, true).unwrap();
         sprite_tab(&mut ed);
         ed.tool = Tool::Pencil;
         ed.primary = 4;
@@ -921,6 +921,17 @@ mod tests {
         ed.save();
         assert!(!dir.join("chars/hero.pxl").exists());
         assert!(pixelle_core::ProjectDir::load(&dir).unwrap().sprites.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_folder_that_is_not_a_project_is_left_alone() {
+        let dir = std::env::temp_dir().join(format!("pixelle-not-a-project-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ed = editor();
+        assert!(ed.open_project(&dir, false).is_err());
+        assert!(!dir.join("project.pxl").exists(), "nothing was written");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

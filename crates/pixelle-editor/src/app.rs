@@ -252,7 +252,7 @@ impl Editor {
             p.join(folder::ROOT).exists().then_some(p)
         });
         if let Some(path) = path {
-            ed.open_project(&folder_of(&path))?;
+            ed.open_project(&folder_of(&path), false)?;
         }
         if let Some(name) = args.open {
             let kind = match ed.project.kind(&name) {
@@ -297,10 +297,13 @@ impl Editor {
 
     // --- Projects ------------------------------------------------------------------------------
 
-    /// Open a project folder, or start one in it if it has no `project.pxl`.
-    pub fn open_project(&mut self, dir: &Path) -> anyhow::Result<()> {
+    /// Open a project folder. One with no `project.pxl` is refused unless `start` says to begin a
+    /// project there: opening a folder by mistake must never put a project in it.
+    pub fn open_project(&mut self, dir: &Path, start: bool) -> anyhow::Result<()> {
         let project = if dir.join(folder::ROOT).exists() {
             ProjectDir::load(dir)?
+        } else if !start {
+            anyhow::bail!("{} has no {}: it is not a Pixelle project (File → Open or start a project folder… starts one)", dir.display(), folder::ROOT);
         } else {
             let name = dir.file_name().map_or("untitled".into(), |n| n.to_string_lossy().into_owned());
             let p = new_project(&name, presets::DB32);
@@ -341,9 +344,18 @@ impl Editor {
         if !self.confirm_discard() {
             return;
         }
-        if let Some(dir) = rfd::FileDialog::new().set_title("Open or start a project folder").pick_folder()
-            && let Err(e) = self.open_project(&dir)
-        {
+        let Some(dir) = rfd::FileDialog::new().set_title("Open or start a project folder").pick_folder() else { return };
+        let start = dir.join(folder::ROOT).exists()
+            || rfd::MessageDialog::new()
+                .set_title("Start a project here?")
+                .set_description(format!("{} has no {}. Start a new Pixelle project in it?", dir.display(), folder::ROOT))
+                .set_buttons(rfd::MessageButtons::YesNo)
+                .show()
+                == rfd::MessageDialogResult::Yes;
+        if !start {
+            return;
+        }
+        if let Err(e) = self.open_project(&dir, true) {
             self.say(format!("Could not open {}: {e}", dir.display()));
         }
     }
