@@ -1479,9 +1479,13 @@ impl Editor {
             let c = self.canvas_rect.center();
             self.view.step_zoom(self.canvas_rect, c, -1);
         }
-        // Step through an animation's steps, or a sprite's frames.
+        // Step through an animation's steps, or a sprite's frames. The arrows nudge a
+        // selection when there is one.
         if self.anim.is_some() {
-            let step = if pressed(Key::OpenBracket) || pressed(Key::Comma) { -1 } else if pressed(Key::CloseBracket) || pressed(Key::Period) { 1 } else { 0 };
+            let arrows = self.selection.is_none();
+            let back = pressed(Key::OpenBracket) || pressed(Key::Comma) || (arrows && pressed(Key::ArrowLeft));
+            let on = pressed(Key::CloseBracket) || pressed(Key::Period) || (arrows && pressed(Key::ArrowRight));
+            let step = if back { -1 } else if on { 1 } else { 0 };
             if step != 0 {
                 self.step_anim(step);
             }
@@ -1596,7 +1600,7 @@ impl Editor {
                 ui.label("Space/middle drag pans · ⌘/pinch scroll zooms");
                 ui.label("+/- zoom · ⌘0 fit · Esc deselect · Enter commit");
                 ui.label("⌘S saves every changed file · ⌘N new file · ⌘W close tab");
-                ui.label("Click an animation's preview to open it frame by frame: [ ] step, Enter plays, Esc goes back");
+                ui.label("Click an animation's preview to open it frame by frame: ← → or [ ] step, Enter plays, Esc goes back");
             });
             ui.separator();
             self.tabs_bar(ui);

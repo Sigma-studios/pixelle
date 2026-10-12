@@ -162,14 +162,14 @@ impl Editor {
             }
             ui.label(RichText::new(&a.anim).strong());
             ui.separator();
-            if ui.button("◀").on_hover_text("Previous step  [").clicked() {
+            if ui.button("◀").on_hover_text("Previous step  ← [").clicked() {
                 self.step_anim(-1);
             }
             let play = if a.playing.is_some() { "Pause" } else { "Play" };
             if ui.button(play).on_hover_text("Enter").clicked() {
                 self.toggle_play();
             }
-            if ui.button("▶").on_hover_text("Next step  ]").clicked() {
+            if ui.button("▶").on_hover_text("Next step  → ]").clicked() {
                 self.step_anim(1);
             }
             ui.label(format!("step {} of {}", a.step + 1, steps.len()));
