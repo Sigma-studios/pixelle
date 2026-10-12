@@ -91,6 +91,8 @@ pub struct Document {
     pub revision: u64,
     /// Paint only inside sprite frames and tiles: what is outside them belongs to no file.
     pub clip: bool,
+    /// Painting is kept to this rect, when set: the frame the animation view shows.
+    pub only: Option<IRect>,
     undo: Vec<Change>,
     redo: Vec<Change>,
     stroke: Option<Stroke>,
@@ -107,6 +109,7 @@ impl Document {
             dirty: false,
             revision: 0,
             clip: false,
+            only: None,
             undo: Vec::new(),
             redo: Vec::new(),
             stroke: None,
@@ -117,6 +120,9 @@ impl Document {
 
     /// Whether a pixel of a pixel layer belongs to a frame or a tile, when painting is clipped.
     pub fn paintable(&self, p: IVec2) -> bool {
+        if let Some(r) = self.only {
+            return r.contains(p);
+        }
         !self.clip
             || self.project.sprites.iter().any(|s| s.frames.iter().any(|f| f.rect.contains(p)))
             || self.project.tilesets.iter().any(|ts| (0..ts.count).any(|i| ts.tile_rect(i).contains(p)))

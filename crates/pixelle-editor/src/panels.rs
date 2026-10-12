@@ -767,6 +767,7 @@ impl Editor {
         }
         let frame_label = |i: usize| names.get(i).filter(|n| !n.is_empty()).map_or(format!("{i}"), |n| format!("{i} {n}"));
         let t = self.time();
+        let mut open_anim = None;
         for (anim, steps) in &file.anims {
             let sprite_name = format!("{name}{}{anim}", folder::ANIM_SEPARATOR);
             ui.horizontal(|ui| {
@@ -783,10 +784,18 @@ impl Editor {
                 }
                 if let Some((tex, size)) = self.backend.frame(ui.ctx(), &self.doc.project, &sprite_name, at) {
                     let k = (48.0 / size[0].max(size[1]) as f32).floor().max(1.0);
-                    let (r, _) = ui.allocate_exact_size(vec2(size[0] as f32 * k, size[1] as f32 * k), Sense::hover());
-                    ui.painter().rect_filled(r, 0.0, Color32::from_black_alpha(90));
+                    let (r, resp) = ui.allocate_exact_size(vec2(size[0] as f32 * k, size[1] as f32 * k), Sense::click());
+                    let open = self.anim.as_ref().is_some_and(|a| a.anim == *anim);
+                    let bg = if resp.hovered() || open { Color32::from_white_alpha(30) } else { Color32::from_black_alpha(90) };
+                    ui.painter().rect_filled(r, 0.0, bg);
                     ui.painter().image(tex, r, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                    if open {
+                        ui.painter().rect_stroke(r, 0.0, egui::Stroke::new(1.0, Color32::from_rgb(255, 210, 60)), egui::StrokeKind::Outside);
+                    }
                     ui.ctx().request_repaint_after(std::time::Duration::from_millis(16));
+                    if resp.on_hover_text("Open it frame by frame").clicked() {
+                        open_anim = Some(anim.clone());
+                    }
                 }
                 ui.vertical(|ui| {
                     let mut new = anim.clone();
@@ -857,6 +866,9 @@ impl Editor {
                     self.edit_sprite("Add step", None, |s| s.anims.get_mut(&a).expect("the animation").push(folder::Step { frame, duration: d }));
                 }
             });
+        }
+        if let Some(anim) = open_anim {
+            self.open_anim(&anim);
         }
     }
 }

@@ -10,6 +10,7 @@ use pixelle_core::palette::presets;
 use pixelle_core::render::Indexed;
 use pixelle_core::{IRect, IVec2, LayerId, Project, bake, png_io};
 
+use crate::anim::AnimView;
 use crate::backend::{CanvasBackend, CpuTiles};
 use crate::doc::Document;
 use crate::tools::Tool;
@@ -57,6 +58,10 @@ pub struct Options {
     pub pixel_perfect: bool,
     pub mirror: bool,
     pub minimap: bool,
+    /// In the animation view: the steps around the one shown, faint.
+    pub ghosts: bool,
+    pub ghost_count: usize,
+    pub ghost_tint: bool,
 }
 
 /// A screenshot requested from the command line, for checking the editor without a person.
@@ -74,6 +79,7 @@ pub struct TabState {
     pub selected: Selected,
     pub tool: Tool,
     pub fit_pending: bool,
+    pub anim: Option<AnimView>,
 }
 
 pub struct Tab {
@@ -149,6 +155,8 @@ pub struct Editor {
     /// Where each animation's preview goes, worked out at a revision.
     pub previews: (u64, std::collections::HashMap<String, IRect>),
     pub pending_fit_rect: Option<IRect>,
+    /// The open sprite's animation being looked at frame by frame, if one is.
+    pub anim: Option<AnimView>,
 }
 
 pub struct Args {
@@ -159,6 +167,8 @@ pub struct Args {
     pub screenshot: Option<PathBuf>,
     /// An asset to open in a tab.
     pub open: Option<String>,
+    /// An animation of that file to open in the animation view.
+    pub anim: Option<String>,
     pub zoom: Option<f32>,
     pub tool: Option<String>,
     pub layer: Option<String>,
@@ -214,6 +224,9 @@ impl Editor {
                 pixel_perfect: true,
                 mirror: false,
                 minimap: true,
+                ghosts: true,
+                ghost_count: 1,
+                ghost_tint: true,
             },
             selection: None,
             floating: None,
@@ -240,6 +253,7 @@ impl Editor {
             shape_filled: false,
             previews: (u64::MAX, Default::default()),
             pending_fit_rect: None,
+            anim: None,
         };
         ed.settle_tab();
         let remember = args.remember;
@@ -261,6 +275,12 @@ impl Editor {
                 None => anyhow::bail!("no file {name:?} in the project"),
             };
             ed.open_tab(kind);
+        }
+        if let Some(anim) = args.anim {
+            if ed.anim_steps(&anim).is_none_or(|(_, s)| s.is_empty()) {
+                anyhow::bail!("no animation {anim:?} in the file open");
+            }
+            ed.open_anim(&anim);
         }
         if let Some(name) = args.layer {
             ed.active_layer = ed.doc.project.layer_named(&name).map(|l| l.id);
@@ -423,6 +443,7 @@ impl Editor {
             selected: std::mem::replace(&mut self.selected, Selected::None),
             tool: self.tool,
             fit_pending: self.fit_pending,
+            anim: self.anim.take(),
         };
         self.tabs[self.active].state = Some(state);
     }
@@ -441,6 +462,7 @@ impl Editor {
         self.selected = s.selected;
         self.tool = s.tool;
         self.fit_pending = s.fit_pending;
+        self.anim = s.anim;
         if self.tabs[i].kind == TabKind::Sandbox {
             self.refresh_sandbox();
         }
@@ -470,7 +492,7 @@ impl Editor {
         }
         self.tabs.push(Tab {
             kind,
-            state: Some(TabState { doc, view: View::default(), active_layer: None, selected: Selected::None, tool: Tool::Pencil, fit_pending: true }),
+            state: Some(TabState { doc, view: View::default(), active_layer: None, selected: Selected::None, tool: Tool::Pencil, fit_pending: true, anim: None }),
         });
         let i = self.tabs.len() - 1;
         self.activate(i);
@@ -1306,7 +1328,9 @@ impl Editor {
             });
         });
         egui::Panel::right("side").default_size(320.0).show(ui, |ui| self.side_panel(ui));
-        egui::Panel::top("tabs").show(ui, |ui| self.tabs_bar(ui));
+        if self.anim.is_some() {
+            egui::Panel::bottom("anim").show(ui, |ui| self.anim_bar(ui));
+        }
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(egui::Color32::from_gray(38)))
             .show(ui, |ui| self.canvas(ui));
@@ -1317,6 +1341,7 @@ impl Editor {
 
     fn housekeeping(&mut self, ctx: &egui::Context) {
         self.share_project_wide();
+        self.sync_anim();
         let changes = self.doc.take_changes();
         if !changes.is_empty() {
             self.backend.invalidate(&changes);
@@ -1429,12 +1454,18 @@ impl Editor {
             std::mem::swap(&mut self.primary, &mut self.secondary);
         }
         if pressed(Key::Escape) {
+            if self.selection.is_none() && self.floating.is_none() && self.placing_point.is_none() {
+                self.close_anim();
+            }
             self.commit_floating();
             self.selection = None;
             self.placing_point = None;
             self.drag = None;
         }
         if pressed(Key::Enter) {
+            if self.floating.is_none() && self.anim.is_some() {
+                self.toggle_play();
+            }
             self.commit_floating();
         }
         if pressed(Key::Delete) || pressed(Key::Backspace) {
@@ -1448,8 +1479,13 @@ impl Editor {
             let c = self.canvas_rect.center();
             self.view.step_zoom(self.canvas_rect, c, -1);
         }
-        // Step through a sprite's frames.
-        if let Selected::Sprite { name, frame } = self.selected.clone() {
+        // Step through an animation's steps, or a sprite's frames.
+        if self.anim.is_some() {
+            let step = if pressed(Key::OpenBracket) || pressed(Key::Comma) { -1 } else if pressed(Key::CloseBracket) || pressed(Key::Period) { 1 } else { 0 };
+            if step != 0 {
+                self.step_anim(step);
+            }
+        } else if let Selected::Sprite { name, frame } = self.selected.clone() {
             let n = self.doc.project.sprite(&name).map_or(1, |s| s.frames.len()) as i32;
             let step = if pressed(Key::OpenBracket) { -1 } else if pressed(Key::CloseBracket) { 1 } else { 0 };
             if step != 0 {
@@ -1560,7 +1596,10 @@ impl Editor {
                 ui.label("Space/middle drag pans · ⌘/pinch scroll zooms");
                 ui.label("+/- zoom · ⌘0 fit · Esc deselect · Enter commit");
                 ui.label("⌘S saves every changed file · ⌘N new file · ⌘W close tab");
+                ui.label("Click an animation's preview to open it frame by frame: [ ] step, Enter plays, Esc goes back");
             });
+            ui.separator();
+            self.tabs_bar(ui);
         });
     }
 

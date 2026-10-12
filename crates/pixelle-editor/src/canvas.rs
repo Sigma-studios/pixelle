@@ -32,13 +32,25 @@ impl Editor {
         }
         self.input(ui, &response, rect);
 
-        let painter = ui.painter_at(rect);
         let ctx = ui.ctx().clone();
-        self.pending_tiles = self.backend.paint(&ctx, &painter, &self.doc.project, &self.view, rect);
+        let painter = ui.painter_at(rect);
+        // The animation view shows one frame, over the faint frames around it.
+        let frame = self.anim.as_ref().map(|a| self.view.rect_to_screen(rect, a.rect));
+        let (art, over) = match frame {
+            Some(f) => (painter.with_clip_rect(f), painter.with_clip_rect(f.expand(3.0))),
+            None => (painter.clone(), painter),
+        };
+        if frame.is_some() {
+            self.paint_ghosts(&ctx, &art, rect);
+        }
+        self.pending_tiles = self.backend.paint(&ctx, &art, &self.doc.project, &self.view, rect);
         if self.pending_tiles {
             ctx.request_repaint();
         }
-        self.overlays(&ctx, &painter, rect, response.hover_pos());
+        if let Some(f) = frame {
+            over.rect_stroke(f, 0.0, Stroke::new(1.0, Color32::from_white_alpha(60)), StrokeKind::Outside);
+        }
+        self.overlays(&ctx, &over, rect, response.hover_pos());
     }
 
     // --- Input ---------------------------------------------------------------------------------
@@ -99,6 +111,17 @@ impl Editor {
 
     fn press(&mut self, px: IVec2, pos: Pos2, button: PointerButton, mods: egui::Modifiers) -> Option<Drag> {
         let secondary = button == PointerButton::Secondary;
+
+        if let Some(a) = &mut self.anim {
+            a.playing = None;
+        } else if button == PointerButton::Primary
+            && self.opts.previews
+            && let Some(name) = self.previews.1.iter().find(|(_, r)| r.contains(px)).map(|(n, _)| n.clone())
+            && let Some((_, anim)) = name.rsplit_once(pixelle_core::folder::ANIM_SEPARATOR)
+        {
+            self.open_anim(anim);
+            return None;
+        }
 
         if let Some(name) = self.placing_point.clone() {
             if let Selected::Sprite { name: sprite, frame } = self.selected.clone() {
@@ -520,7 +543,7 @@ impl Editor {
             painter.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::from_white_alpha(180)), StrokeKind::Outside);
         }
 
-        if self.opts.minimap {
+        if self.opts.minimap && self.anim.is_none() {
             self.minimap(ctx, painter, screen);
         }
     }
@@ -534,7 +557,9 @@ impl Editor {
         let zoom = self.view.zoom;
         let label_font = FontId::proportional(11.0);
 
-        if self.opts.previews {
+        let only = self.anim.as_ref().map(|a| a.rect);
+        let previews = self.opts.previews && only.is_none();
+        if previews {
             self.refresh_previews();
         }
         let t = self.time();
@@ -547,7 +572,7 @@ impl Editor {
             let visible = s.frames.iter().any(|f| !f.rect.intersect(&vis).is_empty());
 
             if self.opts.sprite_boxes && visible && !anim {
-                for (i, f) in s.frames.iter().enumerate() {
+                for (i, f) in s.frames.iter().enumerate().filter(|(_, f)| only.is_none_or(|r| r == f.rect)) {
                     let r = self.view.rect_to_screen(screen, f.rect);
                     let (w, c) = if is_sel {
                         let current = selected.as_ref().is_some_and(|(_, fr)| *fr == i);
@@ -562,7 +587,7 @@ impl Editor {
                         painter.rect_filled(Rect::from_center_size(r.max, vec2(HANDLE, HANDLE)), 1.0, Color32::from_rgb(255, 210, 60));
                     }
                 }
-                if is_sel || is_hover {
+                if (is_sel || is_hover) && only.is_none() {
                     let r = self.view.rect_to_screen(screen, s.frames[0].rect);
                     let text = if s.is_animation() { format!("{} ▶", s.name) } else { s.name.clone() };
                     let galley_rect = painter.text(r.left_top() - vec2(0.0, 3.0), Align2::LEFT_BOTTOM, &text, label_font.clone(), Color32::WHITE);
@@ -573,7 +598,7 @@ impl Editor {
 
             // Anchors of the selected sprite.
             if is_sel && !anim {
-                for f in &s.frames {
+                for f in s.frames.iter().filter(|f| only.is_none_or(|r| r == f.rect)) {
                     for (name, p) in &f.points {
                         let c = self.view.to_screen(screen, pos2(f.rect.x as f32 + p.x as f32 + 0.5, f.rect.y as f32 + p.y as f32 + 0.5));
                         let k = (zoom * 0.5).clamp(3.0, 8.0);
@@ -592,7 +617,7 @@ impl Editor {
             }
 
             // Animation preview, playing beside the strip.
-            if self.opts.previews
+            if previews
                 && s.is_animation()
                 && let Some(at) = self.previews.1.get(&s.name).copied()
                 && !at.intersect(&vis).is_empty()
@@ -710,7 +735,7 @@ mod tests {
     use egui::Modifiers;
 
     fn editor() -> Editor {
-        let mut ed = Editor::new(Args { project: None, remember: false, screenshot: None, open: None, zoom: None, tool: None, layer: None }).unwrap();
+        let mut ed = Editor::new(Args { project: None, remember: false, screenshot: None, open: None, anim: None, zoom: None, tool: None, layer: None }).unwrap();
         ed.canvas_rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
         ed.view.center = vec2(0.0, 0.0);
         ed.view.zoom = 4.0;
@@ -865,6 +890,43 @@ mod tests {
         assert_eq!(ed.doc.get(l, IVec2::new(8, 0)), 0, "outside the frame belongs to no file");
         ed.write_back_all();
         assert_eq!(ed.project.sprites["hero"].frames[0].pixels["art"].get(7, 0), 3);
+    }
+
+    #[test]
+    fn the_animation_view_paints_the_frame_shown_and_adds_frames_at_the_end() {
+        let mut ed = editor();
+        let mut s = pixelle_core::SpriteFile::new(8, 8);
+        s.insert_frame(1, pixelle_core::folder::SpriteFrame::new(8, 8));
+        s.anims.insert("walk".into(), vec![pixelle_core::folder::Step { frame: 1, duration: 0.1 }, pixelle_core::folder::Step { frame: 0, duration: 0.2 }]);
+        ed.new_file("hero", pixelle_core::folder::File::Sprite(s)).unwrap();
+        ed.open_anim("walk");
+        let shown = ed.anim.as_ref().unwrap().rect;
+        assert_eq!(shown, ed.doc.project.sprites[0].frames[1].rect, "the first step shows frame 1");
+
+        // A line across the whole strip only lands in the frame shown.
+        ed.tool = Tool::Line;
+        ed.primary = 3;
+        drag(&mut ed, &[(-40, shown.y), (shown.max().x + 40, shown.y)], PointerButton::Primary, Modifiers::NONE);
+        let l = art(&ed);
+        let f0 = ed.doc.project.sprites[0].frames[0].rect;
+        assert_eq!(ed.doc.get(l, shown.min()), 3);
+        assert_eq!(ed.doc.get(l, f0.min()), 0, "the frame not shown is left alone");
+
+        // + New frame: a copy at the end of the sheet, as the next step.
+        let a = ed.anim.clone().unwrap();
+        let (_, steps) = ed.anim_steps("walk").unwrap();
+        ed.new_anim_frame(&a, steps[0]);
+        ed.sync_anim();
+        let (_, steps) = ed.anim_steps("walk").unwrap();
+        assert_eq!(steps.iter().map(|s| s.frame).collect::<Vec<_>>(), [1, 2, 0]);
+        assert_eq!(ed.anim.as_ref().unwrap().step, 1);
+        assert_eq!(ed.doc.get(l, ed.doc.project.sprites[0].frames[2].rect.min()), 3, "a copy of the frame shown");
+
+        // Stepping moves on; closing goes back to the sheet.
+        ed.step_anim(1);
+        assert_eq!(ed.anim.as_ref().unwrap().step, 2);
+        ed.close_anim();
+        assert!(ed.anim.is_none() && ed.doc.only.is_none());
     }
 
     #[test]

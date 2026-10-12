@@ -53,6 +53,7 @@ cargo run -p pixelle-cli -- info examples/showcase/assets/run2d
 - **Saving:** ⌘S writes every file that changed and nothing else. Renames and deletes reach the disk at the same time.
 - **The Sandbox:** the first tab, always open. It's an infinite canvas for trying the project's terrains with the Terrain tool and for doodling. It is never saved.
 - **Sprite tabs:** frames sit in a strip, and painting stays inside them. Frames are added, duplicated, reordered, resized and named in the inspector; `[` and `]` step through them. The sheet's animations play in a column to its left. The inspector's Animations section makes them from the selected frame, then edits their steps (frame and duration), order and names, with a preview of each.
+- **Animation view:** click an animation's preview, on the canvas or in the inspector, to draw it a frame at a time, as in Aseprite. The steps before and after show faintly beneath (Ghosts: how many, and tinted red before, blue after). `[` `]` step, Enter plays, Esc goes back to the sheet. The strip below picks a step. **+ New frame** copies the frame shown to the end of the sheet as the next step, so the frame numbers the game already uses don't move.
 - **Terrain tabs:** the tiles are labelled by what they are ("corner top-left", "inside bottom-right"). Below them is a patch of ground drawn with them, which you paint with `T`.
 - **The palette** belongs to the project. Inserting or deleting a colour remaps every file, and is its own undo step.
 
@@ -63,7 +64,7 @@ cargo run -p pixelle-cli -- info examples/showcase/assets/run2d
 - **Moving around:** Space or the middle button pans. ⌘-scroll or pinch zooms; `+`/`-` step the zoom; ⌘0 fits.
 - **Undo:** ⌘Z / ⇧⌘Z.
 - **Selections:** ⌘C / ⌘X / ⌘V; arrows nudge; Enter puts pixels down; Esc deselects.
-- **Tabs:** ⌘W closes the tab in front.
+- **Tabs:** they sit beside the menus. ⌘W closes the one in front.
 
 Unsaved work is autosaved to `.pixelle/autosave/` in the project every 30 s and offered back on reopen; `.pixelle/` carries its own `.gitignore`. A file changed by something else is reloaded, or you're asked first if you have unsaved changes to it.
 
