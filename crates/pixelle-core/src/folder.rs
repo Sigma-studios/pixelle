@@ -1026,6 +1026,8 @@ pub fn anim_sprites(name: &str, s: &SpriteFile, sheet_frames: &[Frame], layers: 
             let mut sprite = Sprite::new(format!("{name}{ANIM_SEPARATOR}{anim}"), layers.to_vec(), frames);
             sprite.pivot = s.pivot;
             sprite.tags.insert(ANIM_OF.into(), name.into());
+            let shown: Vec<String> = steps.iter().filter(|s| s.frame < sheet_frames.len()).map(|s| s.frame.to_string()).collect();
+            sprite.tags.insert(ANIM_FRAMES.into(), shown.join(","));
             sprite
         })
         .collect()
@@ -1033,6 +1035,10 @@ pub fn anim_sprites(name: &str, s: &SpriteFile, sheet_frames: &[Frame], layers: 
 
 /// The tag an animation's sprite carries: which sprite it is an animation of.
 pub const ANIM_OF: &str = "anim_of";
+
+/// The tag an animation's sprite carries: which frame of that sprite each of its frames is,
+/// comma-separated. For code that draws the sheet itself and wants the animation's timing.
+pub const ANIM_FRAMES: &str = "anim_frames";
 
 fn paint(grid: &mut Grid, pic: &Indexed, at: IVec2) {
     for yy in 0..pic.h {

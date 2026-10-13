@@ -180,6 +180,13 @@ impl<'a> SpriteRef<'a> {
         Some(FrameRef { frame: self.sprite.frames.get(i)?, index: self.first + i })
     }
 
+    /// For an animation of a sheet (`art::player::anims::RUN`), which frame of the sheet its
+    /// frame `i` is: for code that draws the sheet's frames itself, by index into its own layout,
+    /// and wants the animation's order and timing from the art.
+    pub fn sheet_frame(&self, i: usize) -> Option<usize> {
+        self.tag(pixelle_core::folder::ANIM_FRAMES)?.split(',').nth(i)?.trim().parse().ok()
+    }
+
     /// Free-form metadata set in the editor.
     pub fn tag(&self, key: &str) -> Option<&'a str> {
         self.sprite.tags.get(key).map(String::as_str)
@@ -482,6 +489,35 @@ impl PixelleAnimation {
     pub fn finished(&self, sprite: &SpriteRef) -> bool {
         !self.looping && self.elapsed >= sprite.duration()
     }
+
+    /// Move the clock on, if playing.
+    pub fn tick(&mut self, seconds: f32) {
+        if self.playing {
+            self.elapsed += seconds * self.speed;
+        }
+    }
+
+    /// Back to the first frame.
+    pub fn restart(&mut self) {
+        self.elapsed = 0.0;
+    }
+
+    /// Which of `sprite`'s frames shows at this point in it, by the frames' durations.
+    pub fn frame(&self, sprite: &SpriteRef) -> usize {
+        let total = sprite.duration();
+        if total <= 0.0 || sprite.is_empty() {
+            return 0;
+        }
+        let mut t = if self.looping { self.elapsed.rem_euclid(total) } else { self.elapsed.min(total - 1e-4) };
+        for i in 0..sprite.len() {
+            let d = sprite.frame(i).map_or(0.0, |f| f.duration());
+            if t < d {
+                return i;
+            }
+            t -= d;
+        }
+        sprite.len() - 1
+    }
 }
 
 fn animate(time: Res<Time>, arts: Res<Assets<PixelleArt>>, mut q: Query<(&mut PixelleSprite, &mut PixelleAnimation)>) {
@@ -490,21 +526,11 @@ fn animate(time: Res<Time>, arts: Res<Assets<PixelleArt>>, mut q: Query<(&mut Pi
             continue;
         }
         let Some(sprite) = arts.get(&ps.art).and_then(|a| a.sprite(&ps.name)) else { continue };
-        let total = sprite.duration();
-        if total <= 0.0 {
+        if sprite.duration() <= 0.0 {
             continue;
         }
-        anim.elapsed += time.delta_secs() * anim.speed;
-        let mut t = if anim.looping { anim.elapsed % total } else { anim.elapsed.min(total - 1e-4) };
-        let mut frame = sprite.len() - 1;
-        for i in 0..sprite.len() {
-            let d = sprite.frame(i).map_or(0.0, |f| f.duration());
-            if t < d {
-                frame = i;
-                break;
-            }
-            t -= d;
-        }
+        anim.tick(time.delta_secs());
+        let frame = anim.frame(&sprite);
         if ps.frame != frame {
             ps.frame = frame;
         }
@@ -565,5 +591,32 @@ mod tests {
         assert_eq!(r.offset("muzzle"), Some(Vec2::new(2.5, 0.5)));
         assert_eq!(r.point("muzzle"), Some(IVec2::new(6, 3)));
         assert_eq!(r.offset("nope"), None);
+    }
+
+    #[test]
+    fn an_animation_says_which_sheet_frame_shows_when() {
+        use pixelle_core::folder::{ProjectDir, SpriteFile, SpriteFrame, Step};
+        let mut p = ProjectDir::new("t");
+        let mut s = SpriteFile::new(4, 4);
+        for _ in 0..3 {
+            s.frames.push(SpriteFrame::new(4, 4));
+        }
+        s.anims.insert("run".into(), vec![Step { frame: 2, duration: 0.1 }, Step { frame: 3, duration: 0.3 }]);
+        p.sprites.insert("player".into(), s);
+        let baked = bake::bake_folder(&p);
+        let (mut images, mut layouts) = (Assets::<Image>::default(), Assets::<TextureAtlasLayout>::default());
+        let art = PixelleArt::from_baked(baked, &mut images, &mut layouts);
+        let run = art.sprite("player#run").expect("the animation");
+        assert_eq!((run.sheet_frame(0), run.sheet_frame(1), run.sheet_frame(2)), (Some(2), Some(3), None));
+
+        let mut anim = PixelleAnimation::looping();
+        let at = |anim: &PixelleAnimation| run.sheet_frame(anim.frame(&run));
+        assert_eq!(at(&anim), Some(2));
+        anim.tick(0.15);
+        assert_eq!(at(&anim), Some(3));
+        anim.tick(0.3);
+        assert_eq!(at(&anim), Some(2), "it loops");
+        anim.restart();
+        assert_eq!(anim.frame(&run), 0);
     }
 }
