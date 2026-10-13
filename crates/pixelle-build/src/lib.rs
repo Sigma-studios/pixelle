@@ -13,7 +13,7 @@
 //! ```ignore
 //! // src/main.rs
 //! include!(concat!(env!("OUT_DIR"), "/art.rs"));
-//! // art::weapons::SHOTGUN, art::player::poses::CROUCH, art::points::MUZZLE, ...
+//! // art::weapons::SHOTGUN, art::player::CROUCH, art::player::idle::rects::HEAD, art::points::MUZZLE, ...
 //! ```
 //!
 //! The constants are generated from the project every build, so renaming a sprite in the editor is
@@ -144,6 +144,39 @@ pub fn codegen(baked: &Baked, module: &str, crate_path: &str, source: &str) -> S
             let m = node.children.entry(module_ident(&leaf)).or_default();
             for (i, n) in names.split(',').map(str::trim).enumerate().filter(|(_, n)| !n.is_empty()) {
                 m.consts.push(format!("/// Frame {i} of `{}`.\npub const {}: usize = {i};", s.name, const_ident(n)));
+                // Its rects and points, as values, for code that needs them before any asset has
+                // loaded or with none at all: `art::player::idle::rects::HEAD`.
+                let Some(f) = s.frames.get(i) else { continue };
+                if f.rects.is_empty() && f.points.is_empty() {
+                    continue;
+                }
+                let fm = m.children.entry(module_ident(n)).or_default();
+                if !f.rects.is_empty() {
+                    let rm = fm.children.entry("rects".into()).or_default();
+                    for (rn, r) in &f.rects {
+                        rm.consts.push(format!(
+                            "/// `{rn}` on frame {i} of `{}`, from the frame's top-left.\npub const {}: {crate_path}::pixelle_core::IRect = {crate_path}::pixelle_core::IRect::new({}, {}, {}, {});",
+                            s.name,
+                            const_ident(rn),
+                            r.x,
+                            r.y,
+                            r.w,
+                            r.h
+                        ));
+                    }
+                }
+                if !f.points.is_empty() {
+                    let pm = fm.children.entry("points".into()).or_default();
+                    for (pn, p) in &f.points {
+                        pm.consts.push(format!(
+                            "/// `{pn}` on frame {i} of `{}`, from the frame's top-left.\npub const {}: {crate_path}::pixelle_core::IVec2 = {crate_path}::pixelle_core::IVec2::new({}, {});",
+                            s.name,
+                            const_ident(pn),
+                            p.x,
+                            p.y
+                        ));
+                    }
+                }
             }
         }
         for f in &s.frames {
@@ -259,5 +292,20 @@ mod tests {
         assert_eq!(const_ident("2nd"), "_2ND");
         assert_eq!(module_ident("DawnBringer 32"), "dawn_bringer_32");
         assert_eq!(module_ident("type"), "r#type");
+    }
+
+    #[test]
+    fn a_named_frames_rects_and_points_are_values() {
+        let mut p = ProjectDir::new("t");
+        let mut s = pixelle_core::SpriteFile::new(8, 8);
+        let f = &mut s.frames[0];
+        f.name = Some("idle".into());
+        f.rects.insert("head".into(), pixelle_core::IRect::new(3, 0, 3, 2));
+        f.points.insert("hand".into(), pixelle_core::IVec2::new(5, 4));
+        p.sprites.insert("player".into(), s);
+        let code = codegen(&bake::bake_folder(&p), "art", "::x", "test");
+        assert!(code.contains("pub mod idle {"), "{code}");
+        assert!(code.contains("pub const HEAD: ::x::pixelle_core::IRect = ::x::pixelle_core::IRect::new(3, 0, 3, 2);"), "{code}");
+        assert!(code.contains("pub const HAND: ::x::pixelle_core::IVec2 = ::x::pixelle_core::IVec2::new(5, 4);"), "{code}");
     }
 }
