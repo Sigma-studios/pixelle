@@ -72,6 +72,18 @@ pub struct Shot {
 }
 
 /// A tab's canvas and how it was being looked at, while another tab is in front.
+/// The assembled cells of the terrain tab in front: which follow their quarters, and which have
+/// been drawn over. See [`workspace::follow_quarters`].
+#[derive(Default)]
+pub struct TerrainCells {
+    pub tab: Option<String>,
+    pub revision: u64,
+    pub following: std::collections::HashMap<usize, Indexed>,
+    pub drawn_over: BTreeSet<usize>,
+    /// The terrain's slots as the canvas has them: with or without every cell.
+    pub slots: Vec<pixelle_core::tiles::presets::Slot>,
+}
+
 pub struct TabState {
     pub doc: Document,
     pub view: View,
@@ -90,7 +102,7 @@ pub struct Tab {
 
 /// A dialog waiting on the person.
 pub enum Modal {
-    NewFile { name: String, terrain: bool, w: u32, h: u32, cell: u32, error: Option<String> },
+    NewFile { name: String, terrain: bool, every_cell: bool, w: u32, h: u32, cell: u32, error: Option<String> },
     Rename { from: String, to: String, error: Option<String> },
     Delete(String),
     Recover(BTreeMap<String, String>),
@@ -98,6 +110,11 @@ pub enum Modal {
     DiskChanged(Vec<String>),
     Close,
 }
+
+/// What a terrain's "Every cell" setting does, for its checkbox.
+pub const EVERY_CELL_HELP: &str = "21 tiles are drawn; with this on, the 26 cells otherwise built from four quarters of them \
+get a tile each too. Those start generated from their quarters and follow them as you redraw the 21. Draw over one to make \
+it your own: it stops following, and is the only kind saved to the file.";
 
 pub struct Editor {
     /// The project, as files. Open tabs hold newer copies of their own files until written back.
@@ -157,6 +174,7 @@ pub struct Editor {
     pub pending_fit_rect: Option<IRect>,
     /// The open sprite's animation being looked at frame by frame, if one is.
     pub anim: Option<AnimView>,
+    pub terrain_cells: TerrainCells,
 }
 
 pub struct Args {
@@ -254,6 +272,7 @@ impl Editor {
             previews: (u64::MAX, Default::default()),
             pending_fit_rect: None,
             anim: None,
+            terrain_cells: TerrainCells::default(),
         };
         ed.settle_tab();
         let remember = args.remember;
@@ -716,6 +735,40 @@ impl Editor {
         self.edit(label, key, |p| *p = workspace::reshape_sprite(p, f));
         self.active_layer = layer.and_then(|n| self.doc.project.layer_named(&n)).map(|l| l.id).or(self.active_layer);
         self.fix_selection();
+    }
+
+    /// Change the open terrain's file as one undo step — a setting that changes its tiles — and
+    /// lay its canvas out again.
+    pub fn edit_terrain(&mut self, label: &str, f: impl FnOnce(&mut TerrainFile)) {
+        let TabKind::Terrain(name) = self.kind().clone() else { return };
+        let Some(old) = self.project.terrains.get(&name).cloned() else { return };
+        let dir = self.project.clone();
+        let layer = self.active_layer.and_then(|l| self.doc.project.layer(l)).map(|l| l.name.clone());
+        self.edit(label, None, |p| *p = workspace::reshape_terrain(&dir, &name, p, &old, f));
+        self.active_layer = layer.and_then(|n| self.doc.project.layer_named(&n)).map(|l| l.id).or(self.active_layer);
+        self.fix_selection();
+    }
+
+    /// Keep the open terrain's generated cells following their sources.
+    pub fn follow_terrain(&mut self) {
+        let TabKind::Terrain(name) = self.kind().clone() else {
+            self.terrain_cells = TerrainCells::default();
+            return;
+        };
+        if self.terrain_cells.tab.as_deref() != Some(name.as_str()) {
+            self.terrain_cells = TerrainCells { tab: Some(name.clone()), revision: u64::MAX, ..Default::default() };
+        }
+        if self.terrain_cells.revision == self.doc.revision {
+            return;
+        }
+        let Some(old) = self.project.terrains.get(&name) else { return };
+        let (over, written) = workspace::follow_quarters(&mut self.doc.project, old, &mut self.terrain_cells.following);
+        if !written.is_empty() {
+            self.doc.touch_rects(&written);
+        }
+        self.terrain_cells.drawn_over = over;
+        self.terrain_cells.slots = workspace::canvas_terrain(&self.doc.project, old).preset.two_surface().slots;
+        self.terrain_cells.revision = self.doc.revision;
     }
 
     /// Put floating pixels down where they are.
@@ -1342,6 +1395,7 @@ impl Editor {
     fn housekeeping(&mut self, ctx: &egui::Context) {
         self.share_project_wide();
         self.sync_anim();
+        self.follow_terrain();
         let changes = self.doc.take_changes();
         if !changes.is_empty() {
             self.backend.invalidate(&changes);
@@ -1513,7 +1567,7 @@ impl Editor {
 
     pub fn ask_new_file(&mut self) {
         let g = self.project.grid.max(1);
-        self.modal = Some(Modal::NewFile { name: String::new(), terrain: false, w: g * 2, h: g * 2, cell: g, error: None });
+        self.modal = Some(Modal::NewFile { name: String::new(), terrain: false, every_cell: true, w: g * 2, h: g * 2, cell: g, error: None });
     }
 
     fn menu(&mut self, ui: &mut egui::Ui) {
@@ -1677,7 +1731,7 @@ impl Editor {
         let mut then: Option<Box<dyn FnOnce(&mut Editor)>> = None;
         let mut modal = modal;
         egui::Modal::new(egui::Id::new("modal")).show(ctx, |ui| match &mut modal {
-            Modal::NewFile { name, terrain, w, h, cell, error } => {
+            Modal::NewFile { name, terrain, every_cell, w, h, cell, error } => {
                 ui.heading("New file");
                 let r = ui.add(egui::TextEdit::singleline(name).hint_text("name, e.g. weapons/shotgun").desired_width(260.0));
                 if r.gained_focus() || name.is_empty() {
@@ -1688,12 +1742,13 @@ impl Editor {
                     ui.radio_value(terrain, true, "Terrain");
                 });
                 if *terrain {
-                    ui.label(Preset::TwoSurface { mirror: false }.label());
+                    ui.label(Preset::TwoSurface { mirror: false, every_cell: false }.label());
                     ui.label(egui::RichText::new("Ground against air, every way a tile faces drawn on its own: lit tops, shaded bottoms.").small().weak());
                     ui.horizontal(|ui| {
                         ui.label("Cell");
                         ui.add(egui::DragValue::new(cell).range(2..=128).suffix(" px"));
                     });
+                    ui.checkbox(every_cell, "Every cell (47 tiles)").on_hover_text(EVERY_CELL_HELP);
                     ui.add_enabled(false, egui::Checkbox::new(&mut false, "Mirror (fewer tiles, no shading) — coming later"));
                 } else {
                     ui.horizontal(|ui| {
@@ -1711,7 +1766,7 @@ impl Editor {
                     if ui.button("Create").clicked() || enter {
                         let file = if *terrain {
                             let c = (*cell).max(2) & !1;
-                            File::Terrain(TerrainFile::new(Preset::TwoSurface { mirror: false }, c))
+                            File::Terrain(TerrainFile::new(Preset::TwoSurface { mirror: false, every_cell: *every_cell }, c))
                         } else {
                             File::Sprite(SpriteFile::new(*w, *h))
                         };
@@ -1719,7 +1774,7 @@ impl Editor {
                         let cell_odd = *terrain && *cell % 2 == 1;
                         then = Some(Box::new(move |ed: &mut Editor| {
                             if let Err(e) = ed.new_file(&n, file) {
-                                ed.modal = Some(Modal::NewFile { name: n, terrain: false, w: 16, h: 16, cell: 8, error: Some(e) });
+                                ed.modal = Some(Modal::NewFile { name: n, terrain: false, every_cell: true, w: 16, h: 16, cell: 8, error: Some(e) });
                             } else if cell_odd {
                                 ed.say("Cells are split in quarters, so the size was made even");
                             }

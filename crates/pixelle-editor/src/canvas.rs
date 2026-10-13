@@ -459,18 +459,30 @@ impl Editor {
         }
 
         // A terrain's tiles, by name.
-        if let TabKind::Terrain(name) = self.kind().clone()
-            && let Some(t) = self.project.terrains.get(&name)
+        if let TabKind::Terrain(_) = self.kind()
             && let Some(ts) = self.doc.project.tilesets.first()
         {
-            let slots = t.preset.two_surface().slots;
-            let col = Color32::from_rgb(90, 200, 255);
-            for (i, slot) in slots.iter().enumerate() {
+            let drawn = Color32::from_rgb(90, 200, 255);
+            // An assembled cell: grey while it follows its quarters, orange once drawn over.
+            let generated = Color32::from_gray(150);
+            let over = Color32::from_rgb(255, 170, 60);
+            for (i, slot) in self.terrain_cells.slots.iter().enumerate() {
+                let col = match slot.assembled {
+                    None => drawn,
+                    Some(_) if self.terrain_cells.drawn_over.contains(&i) => over,
+                    Some(_) => generated,
+                };
                 let r = self.view.rect_to_screen(screen, ts.tile_rect(i as u32));
                 painter.rect_stroke(r, 0.0, Stroke::new(1.0, col.gamma_multiply(0.6)), StrokeKind::Outside);
                 if r.width() >= 40.0 {
                     painter.text(r.left_top() - vec2(0.0, 2.0), Align2::LEFT_BOTTOM, &slot.name, FontId::proportional(10.0), col);
                 }
+            }
+            // Where the generated cells start, at any zoom.
+            if let Some(first) = self.terrain_cells.slots.iter().position(|s| s.assembled.is_some()) {
+                let r = self.view.rect_to_screen(screen, ts.tile_rect(first as u32));
+                let at = pos2(r.left() - 8.0, r.center().y);
+                painter.text(at, Align2::RIGHT_CENTER, "generated →", FontId::proportional(11.0), generated);
             }
             if let Some(patch) = workspace::patch_rect(&self.doc.project) {
                 let s = ts.tile_size as i32;
@@ -1028,6 +1040,55 @@ mod tests {
         }
         drag(&mut ed, &[(17, 3)], PointerButton::Secondary, Modifiers::NONE);
         assert_eq!(ed.doc.get(id, IVec2::new(2, 0)), 0);
+    }
+
+    #[test]
+    fn generated_cells_follow_their_quarters_until_drawn_over() {
+        let mut ed = editor();
+        let t = pixelle_core::TerrainFile::new(pixelle_core::folder::Preset::TwoSurface { mirror: false, every_cell: true }, 8);
+        ed.new_file("walls", pixelle_core::folder::File::Terrain(t)).unwrap();
+        ed.follow_terrain();
+        let slots = ed.terrain_cells.slots.clone();
+        assert_eq!(slots.len(), 47);
+        let ts = ed.doc.project.tilesets[0].clone();
+        let l = art(&ed);
+        // The single cell is the four outer corners: its top-left quarter is "corner top-left"'s.
+        let single = slots.iter().position(|s| s.name == "single").unwrap();
+        let source = slots[single].assembled.unwrap()[0] as u32;
+        let (src, cell) = (ts.tile_rect(source).min(), ts.tile_rect(single as u32).min());
+
+        ed.tool = Tool::Pencil;
+        ed.primary = 4;
+        click(&mut ed, src.x + 1, src.y + 1);
+        ed.follow_terrain();
+        assert_eq!(ed.doc.get(l, cell + IVec2::ONE), 4, "the cell follows its quarter");
+        assert!(ed.terrain_cells.drawn_over.is_empty());
+
+        // Drawn over: kept, and no longer following.
+        ed.primary = 6;
+        click(&mut ed, cell.x + 6, cell.y + 6);
+        ed.follow_terrain();
+        assert!(ed.terrain_cells.drawn_over.contains(&single));
+        ed.primary = 9;
+        click(&mut ed, src.x + 2, src.y + 1);
+        ed.follow_terrain();
+        assert_eq!(ed.doc.get(l, cell + IVec2::new(2, 1)), 0, "a cell drawn over stays as drawn");
+        ed.write_back_all();
+        assert!(ed.project.terrains["walls"].drawn_over(single));
+
+        // Undoing the drawing over makes it follow again.
+        ed.undo();
+        ed.undo();
+        ed.follow_terrain();
+        assert!(ed.terrain_cells.drawn_over.is_empty());
+
+        // The setting comes off and back with undo.
+        ed.edit_terrain("Drawn tiles only", |t| t.set_every_cell(false));
+        ed.follow_terrain();
+        assert_eq!(ed.terrain_cells.slots.len(), 21);
+        ed.undo();
+        ed.follow_terrain();
+        assert_eq!(ed.terrain_cells.slots.len(), 47);
     }
 
     #[test]

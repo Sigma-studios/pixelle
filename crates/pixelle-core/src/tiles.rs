@@ -478,6 +478,10 @@ pub mod presets {
         pub role: u32,
         /// How that tile is turned to make this one.
         pub orientation: D4,
+        /// A cell of [`every_cell`] rather than a tile of a role: assembled by default from the
+        /// top-left, top-right, bottom-left and bottom-right quarters of these slots, each cut from
+        /// its own corner. `role` and `orientation` mean nothing for it.
+        pub assembled: Option<[u32; 4]>,
     }
 
     /// A terrain for a grid of two surfaces — ground and air — and the tiles it needs drawn.
@@ -544,7 +548,7 @@ pub mod presets {
         let quarters = quarters_d4(ROLE_TILES);
         if mirror {
             let slots = (0..7)
-                .map(|role| Slot { name: ROLES[role as usize].0.into(), role, orientation: D4::IDENTITY })
+                .map(|role| Slot { name: ROLES[role as usize].0.into(), role, orientation: D4::IDENTITY, assembled: None })
                 .collect();
             return TwoSurface { slots, rules, quarters };
         }
@@ -574,7 +578,7 @@ pub mod presets {
             if let Some(i) = slots.iter().position(|s| s.role == role && open_to(s.role, s.orientation) == dirs) {
                 return i as u32;
             }
-            slots.push(Slot { name: slot_name(role, &dirs), role, orientation });
+            slots.push(Slot { name: slot_name(role, &dirs), role, orientation, assembled: None });
             slots.len() as u32 - 1
         };
         let mut out_rules = Vec::new();
@@ -634,7 +638,91 @@ pub mod presets {
     /// A [`two_surface`] terrain's tiles, drawn from seven canonical tiles in [`minimal_d4`]
     /// order — what a mirrored terrain's art becomes when the mirror is turned off.
     pub fn expand_mirrored(slots: &[Slot], canonical: &[crate::render::Indexed]) -> Vec<crate::render::Indexed> {
-        slots.iter().map(|s| canonical[s.role as usize].transformed(s.orientation)).collect()
+        let mut out: Vec<crate::render::Indexed> = Vec::with_capacity(slots.len());
+        for s in slots {
+            let tile = match s.assembled {
+                Some(from) => assemble(&out, from),
+                None => canonical[s.role as usize].transformed(s.orientation),
+            };
+            out.push(tile);
+        }
+        out
+    }
+
+    /// A [`two_surface`] terrain (mirror off) with a whole tile for every cell it can show.
+    ///
+    /// Where the terrain would build a cell from four quarters, it gets a slot of its own
+    /// instead: 26 more, 47 in all. Each is [`assemble`]d from the quarters it would have been
+    /// built from, so until someone draws over it a terrain looks exactly the same either way —
+    /// `every_cell_draws_what_the_quarters_did` holds that — and one drawn over is drawn as it is.
+    /// A cell is named for the tile it is with its diagonals filled in, and the inside corners it
+    /// adds to that: "edge top, inside bottom-left", "inside top-left + bottom-right".
+    pub fn every_cell(base: TwoSurface) -> TwoSurface {
+        let mut terrain = Terrain::new("", "", base.rules.clone());
+        terrain.quarters = base.quarters.clone();
+        // Each distinct set of quarters, and which neighbours it depends on.
+        let mut cells: Vec<([u32; 4], Vec<u8>)> = Vec::new();
+        for mask in 0..=255u8 {
+            let same = |d: IVec2| NEIGHBOURS.iter().position(|n| *n == d).is_none_or(|s| mask & (1 << s) != 0);
+            if let Some(Choice::Quarters(q)) = terrain.choose(same) {
+                let from = [q[0].tile, q[1].tile, q[2].tile, q[3].tile];
+                match cells.iter_mut().find(|(f, _)| *f == from) {
+                    Some((_, masks)) => masks.push(mask),
+                    None => cells.push((from, vec![mask])),
+                }
+            }
+        }
+        let mut out = base;
+        out.quarters.clear();
+        // In the order of the tiles they add inside corners to, fewest corners first.
+        let mut cells: Vec<_> = cells.into_iter().map(|(from, masks)| (cell_name(&terrain, &out.slots, masks[0]), from, masks)).collect();
+        cells.sort_by(|a, b| a.0.cmp(&b.0));
+        for ((_, name), from, masks) in cells {
+            let mut pattern = [Cond::Any; 8];
+            for (i, cond) in pattern.iter_mut().enumerate() {
+                let ground = masks.iter().all(|m| m & (1 << i) != 0);
+                let air = masks.iter().all(|m| m & (1 << i) == 0);
+                *cond = if ground { Cond::Same } else if air { Cond::NotSame } else { Cond::Any };
+            }
+            out.rules.push(Rule { name: name.clone(), pattern, tile: out.slots.len() as u32, transform: D4::IDENTITY, symmetric: false });
+            out.slots.push(Slot { name, role: u32::MAX, orientation: D4::IDENTITY, assembled: Some(from) });
+        }
+        out
+    }
+
+    /// What an assembled cell is called: the tile it is with its diagonals filled in, and the
+    /// inside corners that adds.
+    fn cell_name(terrain: &Terrain, slots: &[Slot], mask: u8) -> ((u32, usize), String) {
+        let bit = |d: IVec2| NEIGHBOURS.iter().position(|n| *n == d).expect("a neighbour");
+        let ground = |d: IVec2| mask & (1 << bit(d)) != 0;
+        let base = terrain.choose(|d: IVec2| d == IVec2::ZERO || (d.x != 0 && d.y != 0) || ground(d));
+        let corners: Vec<&str> = [IVec2::new(-1, -1), IVec2::new(1, -1), IVec2::new(-1, 1), IVec2::new(1, 1)]
+            .into_iter()
+            .filter(|d| !ground(*d) && ground(IVec2::new(d.x, 0)) && ground(IVec2::new(0, d.y)))
+            .map(dir_name)
+            .collect();
+        let Some(Choice::Whole { tile, .. }) = base else {
+            // Air on every side: no tile has that, so it is all outer corners.
+            return ((u32::MAX, 0), "single".into());
+        };
+        let base = &slots[tile as usize].name;
+        let inside = format!("inside {}", corners.join(" + "));
+        let name = if base == "fill" { inside } else { format!("{base}, {inside}") };
+        ((tile, corners.len()), name)
+    }
+
+    /// A cell from the quarters of four tiles: the top-left quarter of the first, the top-right of
+    /// the second, the bottom-left of the third and the bottom-right of the fourth.
+    pub fn assemble(tiles: &[crate::render::Indexed], from: [u32; 4]) -> crate::render::Indexed {
+        let (w, h) = tiles.first().map_or((0, 0), |t| (t.w, t.h));
+        let (hw, hh) = (w / 2, h / 2);
+        let mut out = crate::render::Indexed::new(w, h);
+        for (i, (x, y, qw, qh)) in [(0, 0, hw, hh), (hw, 0, w - hw, hh), (0, hh, hw, h - hh), (hw, hh, w - hw, h - hh)].into_iter().enumerate() {
+            if let Some(t) = tiles.get(from[i] as usize) {
+                out.blit(&t.crop(x, y, qw, qh), IVec2::new(x as i32, y as i32));
+            }
+        }
+        out
     }
 
     fn orientations(rule: &Rule) -> &'static [D4] {

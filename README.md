@@ -14,7 +14,7 @@ art/
 
 - **Sprites:** a still, an animation or a sheet. Frames can be named for code, have their own size and timing, and carry named points (`muzzle`, `hand`) and rects. Layers can be left out of the export, for sketches.
 - **Animations:** named sequences of a sheet's frames, each with its own duration, e.g. `"run": [(1, 0.11), (2, 0.11)]` in the sprite's file. The game plays one as a sprite of its own, `art::player::anims::RUN`. Its frames share the sheet's place in the atlas, so an animation costs no extra pixels.
-- **Terrains:** "2D grid, two surfaces", ground against air. A cell shows the tile that matches the air around it, or four quarters cut from the tiles' own corners. With the mirror off, which is the only option for now, every way a tile faces is drawn on its own (21 tiles), so tops can be lit and bottoms shaded.
+- **Terrains:** "2D grid, two surfaces", ground against air. A cell shows the tile that matches the air around it, or four quarters cut from the tiles' own corners. With the mirror off, which is the only option for now, every way a tile faces is drawn on its own (21 tiles), so tops can be lit and bottoms shaded. With **Every cell** on, the 26 cells otherwise made of quarters get a tile each (47 in all): they're generated from their quarters and follow the 21 as you redraw them, until you draw over one, which then stays as drawn. Only cells drawn over are written to the file.
 - **Recolour slots:** palette indices the game swaps at runtime.
 
 Every file uses the `.pxl` extension; the first word inside says what it is (`Project(`, `Sprite(`, `Terrain(`). A pixel is two characters, its palette index in hex, with `..` for transparent:
@@ -54,7 +54,7 @@ cargo run -p pixelle-cli -- info examples/showcase/assets/run2d
 - **The Sandbox:** the first tab, always open. It's an infinite canvas for trying the project's terrains with the Terrain tool and for doodling. It is never saved.
 - **Sprite tabs:** frames sit in a strip, and painting stays inside them. Frames are added, duplicated, reordered, resized and named in the inspector; `[` and `]` step through them. The sheet's animations play in a column to its left. The inspector's Animations section makes them from the selected frame, then edits their steps (frame and duration), order and names, with a preview of each.
 - **Animation view:** click an animation's preview, on the canvas or in the inspector, to draw it a frame at a time, as in Aseprite. The steps before and after show faintly beneath (Ghosts: how many, and tinted red before, blue after). ← → (or `[` `]`) step, Enter plays, Esc goes back to the sheet. The strip below picks a step. **+ New frame** copies the frame shown to the end of the sheet as the next step, so the frame numbers the game already uses don't move.
-- **Terrain tabs:** the tiles are labelled by what they are ("corner top-left", "inside bottom-right"). Below them is a patch of ground drawn with them, which you paint with `T`.
+- **Terrain tabs:** the tiles are labelled by what they are ("corner top-left", "inside bottom-right"). Generated cells are grey, and orange once drawn over; the inspector lists those, flags any whose edges no longer match the tiles they came from, and can reset one. Below them is a patch of ground drawn with them, which you paint with `T`.
 - **The palette** belongs to the project. Inserting or deleting a colour remaps every file, and is its own undo step.
 
 **Keys**

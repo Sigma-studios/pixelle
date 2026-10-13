@@ -433,7 +433,7 @@ impl Import {
         ensure!(img.w / TILE == WALL_FRAMES as u32, "walls.png has {} frames, cladding.rs draws from {WALL_FRAMES}", img.w / TILE);
         let pic = self.indexed(&img, &[], "walls")?;
         let canonical: Vec<Indexed> = (0..WALL_FRAMES as u32).map(|f| pic.crop(f * TILE, 0, TILE, TILE)).collect();
-        let preset = Preset::TwoSurface { mirror: false };
+        let preset = Preset::TwoSurface { mirror: false, every_cell: false };
         let mut t = TerrainFile::new(preset, TILE);
         t.tiles = presets::expand_mirrored(&preset.two_surface().slots, &canonical);
         self.p.terrains.insert("walls".into(), t);

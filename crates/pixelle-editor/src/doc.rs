@@ -128,6 +128,13 @@ impl Document {
             || self.project.tilesets.iter().any(|ts| (0..ts.count).any(|i| ts.tile_rect(i).contains(p)))
     }
 
+    /// Pixels changed outside the history by something that follows from an edit, such as a
+    /// terrain's generated cells after their sources: redraw them.
+    pub fn touch_rects(&mut self, rects: &[IRect]) {
+        self.changes.rects.extend_from_slice(rects);
+        self.revision += 1;
+    }
+
     /// Everything must be redrawn: after the canvas was swapped or changed underneath.
     pub fn touch_all(&mut self) {
         self.changes.everything();

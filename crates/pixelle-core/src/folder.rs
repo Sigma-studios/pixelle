@@ -311,14 +311,21 @@ impl SpriteFile {
 /// Which built-in terrain a terrain file draws.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Preset {
-    /// A grid of ground cells against air. See [`presets::two_surface`].
-    TwoSurface { mirror: bool },
+    /// A grid of ground cells against air. See [`presets::two_surface`]; with `every_cell` (and
+    /// the mirror off), [`presets::every_cell`]: a tile for each of the 26 cells otherwise built
+    /// from quarters, generated from the drawn tiles until drawn over.
+    TwoSurface {
+        mirror: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        every_cell: bool,
+    },
 }
 
 impl Preset {
     pub fn two_surface(&self) -> presets::TwoSurface {
-        match self {
-            Preset::TwoSurface { mirror } => presets::two_surface(*mirror),
+        match *self {
+            Preset::TwoSurface { mirror: false, every_cell: true } => presets::every_cell(presets::two_surface(false)),
+            Preset::TwoSurface { mirror, .. } => presets::two_surface(mirror),
         }
     }
 
@@ -347,6 +354,44 @@ impl TerrainFile {
         Self { version: VERSION, preset, cell, tiles: vec![Indexed::new(cell, cell); n] }
     }
 
+    /// What an assembled cell (see [`Preset::TwoSurface`]) looks like when it is not drawn over:
+    /// its quarters, cut from the tiles they come from. `None` for a tile that is drawn.
+    pub fn generated(&self, slot: usize) -> Option<Indexed> {
+        let from = self.preset.two_surface().slots.get(slot)?.assembled?;
+        Some(presets::assemble(&self.tiles, from))
+    }
+
+    /// Whether an assembled cell has been drawn over, rather than following its quarters.
+    pub fn drawn_over(&self, slot: usize) -> bool {
+        self.generated(slot).is_some_and(|g| g != self.tiles[slot])
+    }
+
+    /// Bring every assembled cell that is not drawn over up to date with the tiles it comes from,
+    /// after they changed. `keep` are the ones drawn over, which stay as they are.
+    pub fn regenerate(&mut self, keep: impl Fn(usize) -> bool) {
+        let slots = self.preset.two_surface().slots;
+        for (i, s) in slots.iter().enumerate() {
+            if let Some(from) = s.assembled
+                && !keep(i)
+            {
+                self.tiles[i] = presets::assemble(&self.tiles, from);
+            }
+        }
+    }
+
+    /// Turn [`Preset::TwoSurface`]'s `every_cell` on, adding the assembled cells as generated, or
+    /// off, dropping them — and with them anything drawn over them.
+    pub fn set_every_cell(&mut self, on: bool) {
+        let Preset::TwoSurface { mirror, every_cell } = &mut self.preset;
+        if *mirror || *every_cell == on {
+            return;
+        }
+        *every_cell = on;
+        let n = self.preset.two_surface().slots.len();
+        self.tiles.resize(n, Indexed::new(self.cell, self.cell));
+        self.regenerate(|_| false);
+    }
+
     /// The terrain's rules, pointing at `tiles` by index.
     pub fn terrain(&self, name: &str) -> Terrain {
         let ts = self.preset.two_surface();
@@ -367,12 +412,13 @@ struct TerrainRaw {
 impl From<TerrainFile> for TerrainRaw {
     fn from(t: TerrainFile) -> Self {
         let slots = t.preset.two_surface().slots;
-        TerrainRaw {
-            version: t.version,
-            preset: t.preset,
-            cell: t.cell,
-            tiles: Ordered(slots.into_iter().map(|s| s.name).zip(t.tiles).collect()),
-        }
+        // An assembled cell is written only when drawn over: otherwise it is its quarters, and
+        // follows them when they change.
+        let tiles = (0..slots.len())
+            .filter(|&i| slots[i].assembled.is_none() || t.drawn_over(i))
+            .map(|i| (slots[i].name.clone(), t.tiles[i].clone()))
+            .collect();
+        TerrainRaw { version: t.version, preset: t.preset, cell: t.cell, tiles: Ordered(tiles) }
     }
 }
 
@@ -381,6 +427,7 @@ impl TryFrom<TerrainRaw> for TerrainFile {
     fn try_from(raw: TerrainRaw) -> Result<Self, String> {
         let slots = raw.preset.two_surface().slots;
         let mut tiles = vec![Indexed::new(raw.cell, raw.cell); slots.len()];
+        let mut given = vec![false; slots.len()];
         for (name, pic) in raw.tiles.0 {
             let Some(i) = slots.iter().position(|s| s.name == name) else {
                 let known: Vec<&str> = slots.iter().map(|s| s.name.as_str()).collect();
@@ -390,8 +437,11 @@ impl TryFrom<TerrainRaw> for TerrainFile {
                 return Err(format!("tile {name:?} is {}x{}, but cells are {}", pic.w, pic.h, raw.cell));
             }
             tiles[i] = pic;
+            given[i] = true;
         }
-        Ok(TerrainFile { version: raw.version, preset: raw.preset, cell: raw.cell, tiles })
+        let mut t = TerrainFile { version: raw.version, preset: raw.preset, cell: raw.cell, tiles };
+        t.regenerate(|i| given[i]);
+        Ok(t)
     }
 }
 
@@ -1028,10 +1078,90 @@ mod tests {
         s.frames.push(f);
         s.anims.insert("blink".into(), vec![Step { frame: 0, duration: 0.5 }, Step { frame: 1, duration: 0.1 }]);
         p.sprites.insert("player/idle".into(), s);
-        let mut t = TerrainFile::new(Preset::TwoSurface { mirror: false }, 8);
+        let mut t = TerrainFile::new(Preset::TwoSurface { mirror: false, every_cell: false }, 8);
         t.tiles[0].set(0, 0, 5);
         p.terrains.insert("walls".into(), t);
         p
+    }
+
+    /// Each of the 256 neighbourhoods of a project's `walls`, drawn as the bake draws it.
+    fn every_neighbourhood(p: &ProjectDir) -> Vec<Indexed> {
+        let baked = crate::bake::bake_folder(p);
+        let terrain = baked.terrain("walls").expect("walls");
+        let atlas = Indexed { w: baked.atlas_width, h: baked.atlas_height, px: baked.atlas.clone() };
+        (0..=255u8)
+            .map(|mask| {
+                let same = |d: IVec2| crate::tiles::NEIGHBOURS.iter().position(|n| *n == d).is_none_or(|s| mask & (1 << s) != 0);
+                let mut out = Indexed::new(8, 8);
+                for piece in terrain.cell(same) {
+                    let src = atlas.crop(piece.source.x as u32, piece.source.y as u32, piece.source.w, piece.source.h);
+                    out.blit(&src.transformed(crate::D4::new(false, piece.flip_x, piece.flip_y)), piece.at.min());
+                }
+                out
+            })
+            .collect()
+    }
+
+    /// Walls whose every tile is different noise, so any pixel out of place shows.
+    fn noisy_walls() -> ProjectDir {
+        let mut p = ProjectDir::new("t");
+        crate::palette::presets::add(&mut p.palette, crate::palette::presets::PICO8).unwrap();
+        let mut t = TerrainFile::new(Preset::TwoSurface { mirror: false, every_cell: false }, 8);
+        let mut seed = 7u32;
+        for tile in &mut t.tiles {
+            for y in 0..8 {
+                for x in 0..8 {
+                    seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                    tile.set(x, y, 1 + (seed >> 16) as u8 % 15);
+                }
+            }
+        }
+        p.terrains.insert("walls".into(), t);
+        p
+    }
+
+    #[test]
+    fn every_cell_draws_what_the_quarters_did_until_drawn_over() {
+        let mut p = noisy_walls();
+        let before = every_neighbourhood(&p);
+        let walls = p.terrains.get_mut("walls").unwrap();
+        walls.set_every_cell(true);
+        assert_eq!(walls.tiles.len(), 47);
+        let names: std::collections::BTreeSet<_> = walls.preset.two_surface().slots.into_iter().map(|s| s.name).collect();
+        assert_eq!(names.len(), 47, "every cell has a name of its own");
+        assert_eq!(every_neighbourhood(&p), before, "generated cells are their quarters");
+        // Only whole tiles now: one piece a cell.
+        let baked = crate::bake::bake_folder(&p);
+        let terrain = baked.terrain("walls").unwrap();
+        assert!((0..=255u8).all(|m| {
+            let same = |d: IVec2| crate::tiles::NEIGHBOURS.iter().position(|n| *n == d).is_none_or(|s| m & (1 << s) != 0);
+            terrain.cell(same).len() == 1
+        }));
+
+        // Nothing generated is written, and it comes back.
+        let text = File::Terrain(p.terrains["walls"].clone()).to_text();
+        assert!(text.contains("every_cell: true") && !text.contains("inside top-left +"), "{text}");
+        let File::Terrain(back) = File::from_text("walls.pxl", &text).unwrap() else { panic!() };
+        assert_eq!(back, p.terrains["walls"]);
+
+        // Drawn over: written, kept when its sources change; the others follow them.
+        let walls = p.terrains.get_mut("walls").unwrap();
+        let slots = walls.preset.two_surface().slots;
+        let over = slots.iter().position(|s| s.assembled.is_some()).unwrap();
+        let follows = slots.iter().rposition(|s| s.assembled.is_some()).unwrap();
+        walls.tiles[over].set(0, 0, 0);
+        let from = slots[follows].assembled.unwrap()[0] as usize;
+        walls.tiles[from].set(1, 1, 0);
+        walls.regenerate(|i| i == over);
+        assert!(walls.drawn_over(over) && !walls.drawn_over(follows));
+        assert_eq!(walls.tiles[follows].get(1, 1), 0, "a generated cell follows its quarter");
+        let text = File::Terrain(walls.clone()).to_text();
+        assert!(text.contains(&format!("{:?}", slots[over].name)) && !text.contains(&format!("{:?}", slots[follows].name)));
+        let File::Terrain(back) = File::from_text("walls.pxl", &text).unwrap() else { panic!() };
+        assert_eq!(&back, walls);
+
+        walls.set_every_cell(false);
+        assert_eq!(walls.tiles.len(), 21);
     }
 
     #[test]

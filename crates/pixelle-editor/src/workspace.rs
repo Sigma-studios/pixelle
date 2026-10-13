@@ -6,14 +6,14 @@
 //! file is saved, or anything else needs it, the canvas is read back into the file. The Sandbox
 //! is a canvas that is never read back: somewhere to try the project's terrains.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use pixelle_core::folder::{self, ProjectDir, SpriteFile, SpriteFrame, SpriteLayer, Step, TerrainFile};
 use pixelle_core::layer::{LayerKind, TerrainLayer};
 use pixelle_core::render::Indexed;
-use pixelle_core::tiles::Tileset;
+use pixelle_core::tiles::{Tileset, presets};
 use pixelle_core::{Frame, Grid, IRect, IVec2, Project, Sprite};
 
 /// What a tab shows.
@@ -250,11 +250,82 @@ pub fn patch_rect(p: &Project) -> Option<IRect> {
 }
 
 /// A terrain canvas read back into its file.
+///
+/// Whether the terrain has a tile for every cell is read off how many tiles the sheet has, so
+/// undoing that setting on the canvas undoes it in the file too.
 pub fn canvas_terrain(p: &Project, old: &TerrainFile) -> TerrainFile {
     let mut t = old.clone();
     let (Some(ts), Some(grid)) = (p.tilesets.first(), p.layers.iter().find_map(|l| l.pixels())) else { return t };
     t.tiles = (0..ts.count).map(|i| cut(grid, ts.tile_rect(i))).collect();
+    if let folder::Preset::TwoSurface { mirror: false, every_cell } = &mut t.preset {
+        *every_cell = t.tiles.len() == presets::every_cell(presets::two_surface(false)).slots.len();
+    }
     t
+}
+
+/// A terrain canvas laid out again after `f` changed its file, keeping the ground painted on it.
+pub fn reshape_terrain(dir: &ProjectDir, name: &str, p: &Project, old: &TerrainFile, f: impl FnOnce(&mut TerrainFile)) -> Project {
+    let mut t = canvas_terrain(p, old);
+    f(&mut t);
+    let mut new = terrain_canvas(dir, name, &t);
+    let ground = |p: &Project| p.layers.iter().find_map(|l| match &l.kind {
+        LayerKind::Terrain(t) => Some(t.cells.clone()),
+        _ => None,
+    });
+    if let (Some(before), Some(after), Some(cells)) = (patch_rect(p), patch_rect(&new), ground(p)) {
+        let shift = after.min() - before.min();
+        let mut moved = Grid::new();
+        for (c, v) in cells.iter() {
+            moved.set(c + shift, v);
+        }
+        for l in &mut new.layers {
+            if let LayerKind::Terrain(t) = &mut l.kind {
+                t.cells = moved.clone();
+            }
+        }
+    }
+    new
+}
+
+/// Keep the assembled cells of a terrain canvas (see [`folder::Preset::TwoSurface`]) that nobody
+/// has drawn over following the tiles their quarters are cut from.
+///
+/// `following` holds each such cell as it was last generated: one that still looks like that, or
+/// like what it would be generated as now, follows; one that looks like neither has been drawn
+/// over and is left alone. Returns the cells drawn over and the rects rewritten, which are not an
+/// edit of their own: they are what the edit to their sources means.
+pub fn follow_quarters(p: &mut Project, old: &TerrainFile, following: &mut HashMap<usize, Indexed>) -> (BTreeSet<usize>, Vec<IRect>) {
+    let t = canvas_terrain(p, old);
+    let mut over = BTreeSet::new();
+    let mut written = Vec::new();
+    let Some(ts) = p.tilesets.first().cloned() else { return (over, written) };
+    let slots = t.preset.two_surface().slots;
+    let Some(grid) = p.layers.iter_mut().find_map(|l| match &mut l.kind {
+        LayerKind::Pixels(g) => Some(g),
+        _ => None,
+    }) else {
+        return (over, written);
+    };
+    for (i, s) in slots.iter().enumerate() {
+        let (Some(from), Some(cur)) = (s.assembled, t.tiles.get(i)) else { continue };
+        let generated = presets::assemble(&t.tiles, from);
+        if following.get(&i) != Some(cur) && *cur != generated {
+            following.remove(&i);
+            over.insert(i);
+            continue;
+        }
+        if *cur != generated {
+            let r = ts.tile_rect(i as u32);
+            for y in 0..r.h {
+                for x in 0..r.w {
+                    grid.set(r.min() + IVec2::new(x as i32, y as i32), generated.get(x, y));
+                }
+            }
+            written.push(r);
+        }
+        following.insert(i, generated);
+    }
+    (over, written)
 }
 
 /// The Sandbox's tiles: every terrain of the project, as tilesets far off on a hidden layer.
@@ -514,7 +585,7 @@ mod tests {
         s.frames.push(f);
         s.anims.insert("wave".into(), vec![Step { frame: 1, duration: 0.2 }, Step { frame: 0, duration: 0.1 }]);
         p.sprites.insert("hero".into(), s);
-        let mut t = TerrainFile::new(Preset::TwoSurface { mirror: false }, 8);
+        let mut t = TerrainFile::new(Preset::TwoSurface { mirror: false, every_cell: false }, 8);
         for (i, pic) in t.tiles.iter_mut().enumerate() {
             pic.px.fill(i as u8 + 1);
         }

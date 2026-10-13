@@ -512,12 +512,66 @@ impl Editor {
     }
 
     fn terrain_inspector(&mut self, ui: &mut egui::Ui, name: &str) {
-        let Some(t) = self.project.terrains.get(name).cloned() else { return };
+        let Some(old) = self.project.terrains.get(name).cloned() else { return };
+        // As the canvas has it, which is newer than the file until it is read back.
+        let t = workspace::canvas_terrain(&self.doc.project, &old);
         ui.label(RichText::new(t.preset.label()).strong());
         ui.label(format!("{} tiles of {}×{} px", t.tiles.len(), t.cell, t.cell));
-        let mut mirror = matches!(t.preset, folder::Preset::TwoSurface { mirror: true });
+        let folder::Preset::TwoSurface { mirror, every_cell } = t.preset;
+        let mut every = every_cell;
+        if ui.checkbox(&mut every, "Every cell (47 tiles)").on_hover_text(crate::app::EVERY_CELL_HELP).changed() {
+            let dropped = self.terrain_cells.drawn_over.len();
+            self.edit_terrain(if every { "Every cell" } else { "Drawn tiles only" }, |t| t.set_every_cell(every));
+            if !every && dropped > 0 {
+                self.say(format!("Dropped {dropped} cell(s) you had drawn over; undo brings them back"));
+            }
+        }
+        let mut mirror = mirror;
         ui.add_enabled(false, egui::Checkbox::new(&mut mirror, "Mirror")).on_disabled_hover_text("Fewer tiles, turned to fit, but no shading: coming later");
-        ui.label(RichText::new("Draw each tile in the sheet: a cell of ground shows the tile that matches the air around it, or four quarters cut from the tiles' own corners. Paint the ground below with the Terrain tool (T), right button to erase, to see them together.").small().weak());
+        let how = if every {
+            "Draw the 21 blue tiles: a cell of ground shows the one that matches the air around it. The grey ones are generated from their corners and follow them; draw over one to make it your own (orange)."
+        } else {
+            "Draw each tile in the sheet: a cell of ground shows the tile that matches the air around it, or four quarters cut from the tiles' own corners."
+        };
+        ui.label(RichText::new(format!("{how} Paint the ground below with the Terrain tool (T), right button to erase, to see them together.")).small().weak());
+
+        if every {
+            let over: Vec<usize> = self.terrain_cells.drawn_over.iter().copied().collect();
+            ui.label(format!("{} of 26 generated cells drawn over", over.len()));
+            let slots = self.terrain_cells.slots.clone();
+            for i in over {
+                let (Some(slot), Some(cur)) = (slots.get(i), t.tiles.get(i)) else { continue };
+                let Some(from) = slot.assembled else { continue };
+                let generated = pixelle_core::tiles::presets::assemble(&t.tiles, from);
+                // Its outside rows and columns are what meet the cells around it.
+                let (w, h) = (cur.w, cur.h);
+                let edges_moved = (0..w).any(|x| cur.get(x, 0) != generated.get(x, 0) || cur.get(x, h - 1) != generated.get(x, h - 1))
+                    || (0..h).any(|y| cur.get(0, y) != generated.get(0, y) || cur.get(w - 1, y) != generated.get(w - 1, y));
+                ui.horizontal(|ui| {
+                    ui.label(&slot.name);
+                    if edges_moved {
+                        ui.colored_label(Color32::from_rgb(255, 170, 60), "edges changed")
+                            .on_hover_text("Its outer pixels differ from the tiles it is cut from, which are what its neighbours meet: check the seams on the ground below.");
+                    }
+                    if ui.small_button("Reset").on_hover_text("Back to its quarters, following them again").clicked()
+                        && let Some(r) = self.doc.project.tilesets.first().map(|ts| ts.tile_rect(i as u32))
+                    {
+                        self.edit("Reset cell", None, |p| {
+                            if let Some(grid) = p.layers.iter_mut().find_map(|l| match &mut l.kind {
+                                LayerKind::Pixels(g) => Some(g),
+                                _ => None,
+                            }) {
+                                for y in 0..r.h {
+                                    for x in 0..r.w {
+                                        grid.set(r.min() + IVec2::new(x as i32, y as i32), generated.get(x, y));
+                                    }
+                                }
+                            }
+                        });
+                    }
+                });
+            }
+        }
         if ui.button("Reset the ground").clicked()
             && let Some(fresh) = workspace::canvas_for(&self.project, self.kind())
         {
