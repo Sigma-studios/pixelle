@@ -548,14 +548,11 @@ impl Editor {
             if ui.button("+ Frame").on_hover_text("A blank frame after this one").clicked() {
                 self.edit_sprite("Add frame", None, |s| {
                     let f = &s.frames[frame];
+                    // A sheet's frames have no duration and stay that way: timing is for
+                    // animations, which are made separately.
                     let mut new = SpriteFrame::new(f.w, f.h);
-                    new.duration = if f.duration > 0.0 { f.duration } else { 0.1 };
+                    new.duration = f.duration;
                     new.points = f.points.clone();
-                    if f.duration == 0.0 {
-                        for fr in &mut s.frames {
-                            fr.duration = 0.1;
-                        }
-                    }
                     s.insert_frame(frame + 1, new);
                 });
                 self.selected = Selected::Sprite { name: name.into(), frame: frame + 1 };
