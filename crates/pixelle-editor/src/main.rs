@@ -6,7 +6,7 @@
 //! ```
 //!
 //! With no folder, it opens the project opened last. `--open` opens one of its files in a tab, by
-//! name (`weapons`, `wip/walls2`), and `--anim` one of its animations in the animation view. `--screenshot` renders the window once everything has loaded,
+//! name (`weapons`, `fx/bullet`), and `--anim` one of its animations in the animation view. `--screenshot` renders the window once everything has loaded,
 //! saves it and quits: a way to look at the editor from a script.
 
 mod anim;

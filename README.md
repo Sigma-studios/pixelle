@@ -9,7 +9,7 @@ art/
   project.pxl        the palette (labelled sections, up to 256 colours), recolour slots, the list of files
   player.pxl         a sprite: layers, frames, timings, anchor points, pixels as rows of palette indices
   walls.pxl          a terrain: a preset and the tiles it needs
-  wip/walls2.pxl
+  fx/bullet.pxl      a sprite in a folder: its name is fx/bullet
 ```
 
 - **Sprites:** a still, an animation or a sheet. Frames can be named for code, have their own size and timing, and carry named points (`muzzle`, `hand`) and rects. Layers can be left out of the export, for sketches.

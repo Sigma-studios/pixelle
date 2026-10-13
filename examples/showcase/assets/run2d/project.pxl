@@ -227,6 +227,5 @@ Project(
     "props.pxl",
     "walls.pxl",
     "weapons.pxl",
-    "wip/walls2.pxl",
   ],
 )

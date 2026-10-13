@@ -7,8 +7,7 @@
 //!
 //! What goes in:
 //! - a sprite per sheet, frames in sheet order so the game's frame indices still hold, with any
-//!   hidden `.aseprite` layers kept as layers of their own that are not exported, and the
-//!   unexported `walls2.aseprite` as work in progress;
+//!   hidden `.aseprite` layers kept as layers of their own that are not exported;
 //! - the walls as a terrain, "2D grid, two surfaces" with the mirror off: every way a tile faces is
 //!   drawn out, starting from the seven frames `cladding.rs` turns to fit;
 //! - the cycles the game plays out of its sheets in code — running, crouch-walking, a shell, a
@@ -323,22 +322,6 @@ impl Import {
         self.sheet("platforms", &[], &PLATFORMS)?;
         self.walls()?;
         self.animations();
-
-        // Drawn, never exported: kept where it can be finished.
-        let path = self.root.join("assets/images/walls2.aseprite");
-        if path.exists() {
-            let ase = aseprite::parse(&std::fs::read(&path)?)?;
-            let mut s = SpriteFile::new(ase.width, ase.height);
-            s.frames.clear();
-            for f in 0..ase.frames.len() {
-                let pic = self.indexed(&rgba(&ase.visible(f), ase.width, ase.height), &[], "walls2")?;
-                let mut frame = SpriteFrame::new(ase.width, ase.height);
-                frame.set_layer("art", pic);
-                s.frames.push(frame);
-            }
-            self.p.sprites.insert("wip/walls2".into(), s);
-            self.notes.push(format!("walls2.aseprite has no PNG and nothing uses it; its {} frames are wip/walls2", ase.frames.len()));
-        }
         Ok(())
     }
 

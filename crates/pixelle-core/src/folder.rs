@@ -5,7 +5,7 @@
 //!   project.pxl        Project(...)  the palette, recolour slots and the list of files
 //!   player.pxl         Sprite(...)   layers and frames, pixels as rows of palette indices
 //!   walls.pxl          Terrain(...)  a preset and one tile per slot
-//!   wip/walls2.pxl     Sprite(...)
+//!   fx/bullet.pxl      Sprite(...)
 //! ```
 //!
 //! Every file has the same extension; what it is comes from its first word. Each is plain RON, so
@@ -16,7 +16,7 @@
 //! The root lists every file because a game cannot always list a folder — on the web there is no
 //! such thing. Nobody writes that list: it is the set of files in the project, rebuilt on save.
 //!
-//! An asset is named by its path without the extension: `wip/walls2.pxl` is `wip/walls2`.
+//! An asset is named by its path without the extension: `fx/bullet.pxl` is `fx/bullet`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
