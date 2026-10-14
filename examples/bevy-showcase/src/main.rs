@@ -5,7 +5,7 @@
 //! `hand` and `trigger` points; players are recoloured through its recolour slots; a grid map is
 //! autotiled by its walls terrain.
 //!
-//! `cargo run -p showcase` loads the folder; edit any file in it in the editor and it reloads.
+//! `cargo run -p bevy-showcase` loads the folder; edit any file in it in the editor and it reloads.
 //! `PIXELLE_FILE=run2d.pxlb` loads the baked file a web build would; `PIXELLE_SCREENSHOT=out.png`
 //! saves a screenshot and quits.
 

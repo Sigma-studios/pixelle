@@ -2,13 +2,12 @@
 resolver = "3"
 members = [
     "crates/pixelle-core",
-    "crates/pixelle-cli",
     "crates/pixelle-build",
     "crates/pixelle-editor",
     "crates/bevy_pixelle",
-    "examples/showcase",
-    "tools/run2d-import",
+    "examples/bevy-showcase",
 ]
+default-members = ["crates/pixelle-editor"]
 
 [workspace.package]
 edition = "2024"
@@ -25,6 +24,5 @@ postcard = { version = "1", features = ["use-std"] }
 miniz_oxide = "0.8"
 glam = { version = "0.30", features = ["serde"] }
 png = "0.18"
-clap = { version = "4", features = ["derive"] }
 ron = "0.10"
 anyhow = "1"

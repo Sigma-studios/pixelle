@@ -33,18 +33,15 @@ Every file uses the `.pxl` extension; the first word inside says what it is (`Pr
 |---|---|
 | `crates/pixelle-core` | The folder format (`folder`), compositing, terrain rules and presets (`two_surface`, `minimal_d4`, `edge16`, `blob47`), atlas packing, the baked `.pxlb` format, PNG/Aseprite/palette import. No UI or engine dependencies. |
 | `crates/pixelle-editor` | The editor (eframe/egui): a file tree, a tab per open file, and the Sandbox. The canvas renders through a swappable `CanvasBackend`; today that is CPU tiles. |
-| `crates/pixelle-cli` | `pixelle`: `new`, `info`, `bake`, `atlas`, `sheet`, `codegen`, `import-png`, `import-aseprite`, `import-palette`. |
 | `crates/pixelle-build` | For build.rs: generates typed constants (`art::PLAYER`, `art::player::CROUCH`, `art::player::anims::RUN`, a named frame's rects and points as values like `art::player::idle::rects::HEAD`, `art::palette::clothing::RUST`) and bakes the web file. |
 | `crates/bevy_pixelle` | Bevy 0.19 asset loader for a project folder (`project.pxl`, hot-reloading any of its files) and for `.pxlb`. Provides `PixelleSprite` (frames, recolouring, hot reload), `PixelleAnimation`, anchor offsets, runtime terrain autotiling (`art.terrain(..).cell(..)`), and each sprite as a sheet image (`project.pxl#sheet/player`). |
-| `examples/showcase` | run-2d's art in Bevy, driven entirely by the generated names. |
-| `tools/run2d-import` | Turns run-2d's sheets into a project folder, with pixel-exact round-trip checks. |
+| `examples/bevy-showcase` | run-2d's art in Bevy, driven entirely by the generated names. |
 
 ## Try it
 
 ```sh
-cargo run -p pixelle-editor -- examples/showcase/assets/run2d     # edit a project
-cargo run -p showcase                                            # see it in Bevy; saving in the editor hot-reloads
-cargo run -p pixelle-cli -- info examples/showcase/assets/run2d
+cargo run -- examples/bevy-showcase/assets/run2d             # edit a project
+cargo run -p bevy-showcase                                       # see it in Bevy; saving in the editor hot-reloads
 ```
 
 ### Editor
