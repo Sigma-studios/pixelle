@@ -4,6 +4,7 @@ description = "build.rs helper: bake a Pixelle project and generate typed consta
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 pixelle-core.workspace = true

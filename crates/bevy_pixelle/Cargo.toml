@@ -4,6 +4,7 @@ description = "Load Pixelle project folders and baked files (.pxlb) as Bevy asse
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 pixelle-core.workspace = true

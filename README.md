@@ -2,6 +2,8 @@
 
 An indexed pixel-art editor where a project is a folder. A Bevy game reads that folder directly, with no export step.
 
+> **Status:** early (0.1). The file formats and APIs still change without notice, and nothing is on crates.io yet; depend on it by git.
+
 Each sprite and each terrain is a text file of its own, so a change to one sprite touches one file and a few changed pixels are a few changed lines in git. All files share the project's palette. The folder opens as one project:
 
 ```text
@@ -101,3 +103,9 @@ The baked `.pxlb` is only for the web, where a folder of text files would mean m
 ## The baked file
 
 **`.pxlb`** starts with `b"PXLB"`, then a version and flags. After that come the palette, the recolour slots, a deflated indexed atlas, each sprite's frames, timings, anchors and tags, and each terrain's rules and tiles. run-2d's art bakes to a few KB.
+
+## License
+
+Pixelle's code is licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT), at your option. Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
+
+The run-2d art in `examples/bevy-showcase/assets/` is not covered by these licenses: all rights reserved, see [its notice](examples/bevy-showcase/assets/LICENSE). You can run the showcase with it, but not reuse it.

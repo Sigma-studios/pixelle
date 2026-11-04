@@ -13,6 +13,7 @@ default-members = ["crates/pixelle-editor"]
 edition = "2024"
 version = "0.1.0"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/Sigma-studios/pixelle"
 
 [workspace.dependencies]
 pixelle-core = { path = "crates/pixelle-core" }

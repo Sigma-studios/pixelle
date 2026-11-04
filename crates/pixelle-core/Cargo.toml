@@ -4,6 +4,7 @@ description = "Data model, compositing, packing and file format for Pixelle proj
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 serde.workspace = true

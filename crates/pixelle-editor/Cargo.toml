@@ -1,9 +1,10 @@
 [package]
 name = "pixelle-editor"
-description = "The Pixelle editor: an infinite indexed canvas for game art"
+description = "The Pixelle editor: an indexed pixel-art editor for game sprites and terrains"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "pixelle-editor"
