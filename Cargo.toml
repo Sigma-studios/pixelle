@@ -19,7 +19,7 @@ repository = "https://github.com/Sigma-studios/pixelle"
 pixelle-core = { path = "crates/pixelle-core" }
 pixelle-build = { path = "crates/pixelle-build" }
 bevy_pixelle = { path = "crates/bevy_pixelle" }
-bevy = { version = "0.19", default-features = false, features = ["2d"] }
+bevy = { version = "0.20", default-features = false, features = ["2d"] }
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
 miniz_oxide = "0.8"
